@@ -19,3 +19,5 @@ env/
 results/
 plots/
 tmp/
+work/
+deblur.log
