@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from pipeline_lib import discover_inputs, fastq_to_trimmed_fasta, resolve_executable, run_command
+from pipeline_lib import discover_inputs, resolve_executable, run_command
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,49 +18,59 @@ def parse_args() -> argparse.Namespace:
         "--error-dist",
         default="1,0.06,0.02,0.02,0.01,0.005,0.005,0.005,0.001,0.001,0.001,0.0005",
     )
+    parser.add_argument("--jobs-to-start", type=int, default=1)
     return parser.parse_args()
 
 
-def run_deblur_for_sample(
-    fastq_fp: Path,
+def run_fastp_for_sample(
+    fastq_path: Path,
+    fastp_output_dir: Path,
+    fastp_executable_path: str,
+) -> Path:
+    sample_id = fastq_path.name.replace("_1.fastq.gz", "")
+    filtered_fastq_path = fastp_output_dir / f"{sample_id}_1.fastq.gz"
+    run_command(
+        [
+            fastp_executable_path,
+            "--in1",
+            str(fastq_path),
+            "--out1",
+            str(filtered_fastq_path),
+        ]
+    )
+    return filtered_fastq_path
+
+
+def run_deblur_workflow(
+    fastp_output_dir: Path,
     work_dir: Path,
     trim_length: int,
     error_dist: str,
-    deblur_exe: str,
+    jobs_to_start: int,
+    deblur_executable_path: str,
 ) -> Path:
-    sample_id = fastq_fp.name.replace("_1.fastq.gz", "")
-    fasta_fp = work_dir / f"{sample_id}.trim{trim_length}.fasta"
-    derep_fp = work_dir / f"{fasta_fp.name}.derep"
-    clean_fp = Path(str(derep_fp) + ".clean")
-
-    kept_reads = fastq_to_trimmed_fasta(fastq_fp, fasta_fp, trim_length)
-    print(f"  {sample_id}: converted {kept_reads} reads to trimmed FASTA", flush=True)
-
+    workflow_output_dir = work_dir / "workflow"
     run_command(
         [
-            deblur_exe,
-            "dereplicate",
-            fasta_fp.name,
-            derep_fp.name,
-            "--min-size",
-            "2",
-        ],
-        cwd=work_dir,
-    )
-    run_command(
-        [
-            deblur_exe,
-            "deblur-seqs",
-            derep_fp.name,
+            deblur_executable_path,
+            "workflow",
+            "--seqs-fp",
+            str(fastp_output_dir),
+            "--output-dir",
+            str(workflow_output_dir),
+            "--trim-length",
+            str(trim_length),
             "--error-dist",
             error_dist,
-        ],
-        cwd=work_dir,
+            "--jobs-to-start",
+            str(jobs_to_start),
+            "--keep-tmp-files",
+            "--overwrite",
+        ]
     )
-
-    if not clean_fp.exists():
-        raise FileNotFoundError(f"Deblur clean output missing: {clean_fp}")
-    return clean_fp
+    if not workflow_output_dir.exists():
+        raise FileNotFoundError(f"Deblur workflow output missing: {workflow_output_dir}")
+    return workflow_output_dir
 
 
 def main() -> int:
@@ -69,15 +79,31 @@ def main() -> int:
     args.work_dir = args.work_dir.resolve()
     args.work_dir.mkdir(parents=True, exist_ok=True)
 
-    deblur_exe = resolve_executable("deblur")
-    inputs = discover_inputs(args.data_dir)
-    print(f"Discovered {len(inputs)} forward-read FASTQs under {args.data_dir}")
+    fastp_executable_path = resolve_executable("fastp")
+    deblur_executable_path = resolve_executable("deblur")
+    fastq_paths = discover_inputs(args.data_dir)
+    fastp_output_dir = args.work_dir / "fastp"
+    fastp_output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Discovered {len(fastq_paths)} forward-read FASTQs under {args.data_dir}")
 
-    for fp in inputs:
-        print(f"Running Deblur for: {fp}", flush=True)
-        run_deblur_for_sample(fp, args.work_dir, args.trim_length, args.error_dist, deblur_exe)
+    for fastq_path in fastq_paths:
+        print(f"Running fastp for: {fastq_path}", flush=True)
+        filtered_fastq_path = run_fastp_for_sample(
+            fastq_path,
+            fastp_output_dir,
+            fastp_executable_path,
+        )
+        print(f"  staged filtered reads at: {filtered_fastq_path}", flush=True)
 
-    print(f"Finished. Deblur outputs written under: {args.work_dir}")
+    workflow_output_dir = run_deblur_workflow(
+        fastp_output_dir,
+        args.work_dir,
+        args.trim_length,
+        args.error_dist,
+        args.jobs_to_start,
+        deblur_executable_path,
+    )
+    print(f"Finished. Deblur outputs written under: {workflow_output_dir}")
     return 0
 
 
