@@ -1,5 +1,7 @@
 # Downloaded inputs and metadata
-data/
+data/*
+!data/PRJNA825639/
+!data/PRJNA825639/**
 
 # Python bytecode and caches
 __pycache__/
@@ -19,7 +21,5 @@ env/
 results/
 plots/
 tmp/
-work/
-deblur.log
 work/
 deblur.log

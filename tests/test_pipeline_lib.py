@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from src.run_deblur_pcoa import discover_inputs, parse_deblur_clean_fasta
+from src.pipeline_lib import discover_inputs, parse_deblur_clean_fasta
 
 
 def test_parse_deblur_clean_fasta_reads_size_with_trailing_semicolon(tmp_path: Path) -> None:
@@ -18,7 +18,7 @@ def test_parse_deblur_clean_fasta_reads_size_with_trailing_semicolon(tmp_path: P
     assert counts["TGCA"] == 3
 
 
-def test_parse_deblur_clean_fasta_still_supports_no_trailing_semicolon(tmp_path: Path) -> None:
+def test_parse_deblur_clean_fasta_counts_last_sequence_at_eof(tmp_path: Path) -> None:
     clean_fp = tmp_path / "sample.derep.clean"
     clean_fp.write_text(
         ">seq1;size=5\n"

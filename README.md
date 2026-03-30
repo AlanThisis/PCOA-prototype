@@ -37,18 +37,22 @@ python -c "import skbio; print(skbio.__version__)"
 
 The pipeline code also expects Python packages that are now listed in `environment.yml`, including `pandas`, `matplotlib`, and `pytest`.
 
-## First end-to-end forward-only pipeline
+## Forward-only pipeline
 
-Run the forward-only PRJNA825639 ordination pipeline:
+Run the pipeline in three steps:
 
 ```bash
-python src/run_deblur_pcoa.py --data-dir data
+python src/run_deblur.py --data-dir data
+python src/build_table.py
+python src/diversity.py
 ```
 
 If you are not already inside an activated Conda shell, run it explicitly with the environment interpreter:
 
 ```bash
-/opt/conda/envs/pcoa-prototype/bin/python src/run_deblur_pcoa.py --data-dir data
+/opt/conda/envs/pcoa-prototype/bin/python src/run_deblur.py --data-dir data
+/opt/conda/envs/pcoa-prototype/bin/python src/build_table.py
+/opt/conda/envs/pcoa-prototype/bin/python src/diversity.py
 ```
 
 ### Inputs used
@@ -57,15 +61,13 @@ The pipeline recursively scans the supplied `--data-dir` and uses every file mat
 
 It does not do paired-end merging or subsampling.
 
-### What the script does
+### What the scripts do
 
-1. Recursively discovers forward reads matching `*_1.fastq.gz` under the input directory.
-2. Converts each run FASTQ to trimmed (250 bp) FASTA.
-3. Runs `deblur dereplicate` and `deblur deblur-seqs` per run.
-4. Builds one merged sample-by-feature table from Deblur-cleaned outputs.
-5. Computes beta diversity (default: `braycurtis`).
-6. Runs PCoA.
-7. Writes tabular results and a PNG plot.
+1. `run_deblur.py` recursively discovers forward reads matching `*_1.fastq.gz` under the input directory.
+2. `run_deblur.py` converts each run FASTQ to trimmed (250 bp) FASTA, then runs `deblur dereplicate` and `deblur deblur-seqs`.
+3. `build_table.py` reads all `.clean` files from `work/deblur/` and builds one merged sample-by-feature table.
+4. `diversity.py` computes beta diversity (default: `braycurtis`) and runs PCoA.
+5. `diversity.py` writes tabular outputs and a PNG plot.
 
 ### Outputs
 
