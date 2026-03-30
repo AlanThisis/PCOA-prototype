@@ -1,0 +1,21 @@
+# Downloaded inputs and metadata
+data/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environments
+.venv/
+venv/
+env/
+.conda/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Common analysis outputs
+results/
+plots/
+tmp/
