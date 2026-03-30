@@ -35,32 +35,31 @@ deblur --help
 python -c "import skbio; print(skbio.__version__)"
 ```
 
+The pipeline code also expects Python packages that are now listed in `environment.yml`, including `pandas`, `matplotlib`, and `pytest`.
+
 ## First end-to-end forward-only pipeline
 
 Run the forward-only PRJNA825639 ordination pipeline:
 
 ```bash
-python src/run_deblur_pcoa.py
+python src/run_deblur_pcoa.py --data-dir data
+```
+
+If you are not already inside an activated Conda shell, run it explicitly with the environment interpreter:
+
+```bash
+/opt/conda/envs/pcoa-prototype/bin/python src/run_deblur_pcoa.py --data-dir data
 ```
 
 ### Inputs used
 
-The pipeline intentionally uses only these per-run forward reads under `data/`:
+The pipeline recursively scans the supplied `--data-dir` and uses every file matching `*_1.fastq.gz` as a forward-read sample input. Reverse reads like `*_2.fastq.gz` are ignored. This works whether the FASTQs are directly under `data/` or nested under a study subdirectory such as `data/PRJNA825639/`.
 
-- `SRR27336825_1.fastq.gz`
-- `SRR27336826_1.fastq.gz`
-- `SRR27336827_1.fastq.gz`
-- `SRR27336828_1.fastq.gz`
-- `SRR27336829_1.fastq.gz`
-- `SRR27336830_1.fastq.gz`
-- `SRR27336831_1.fastq.gz`
-- `SRR27336832_1.fastq.gz`
-
-It ignores the merged `SAMN27531837.fastq.gz` file and does not do paired-end merging or subsampling.
+It does not do paired-end merging or subsampling.
 
 ### What the script does
 
-1. Validates expected input files in `data/`.
+1. Recursively discovers forward reads matching `*_1.fastq.gz` under the input directory.
 2. Converts each run FASTQ to trimmed (250 bp) FASTA.
 3. Runs `deblur dereplicate` and `deblur deblur-seqs` per run.
 4. Builds one merged sample-by-feature table from Deblur-cleaned outputs.

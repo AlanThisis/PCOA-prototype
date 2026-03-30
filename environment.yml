@@ -1,7 +1,10 @@
 name: pcoa-prototype
 dependencies:
-  - seqkit
-  - scikit-bio
-  - deblur
-  - python=3.11
   - fastq-dl
+  - deblur
+  - matplotlib
+  - pandas
+  - pytest
+  - python=3.11
+  - scikit-bio
+  - seqkit

@@ -5,20 +5,10 @@ import gzip
 import re
 import shutil
 import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 
-
-EXPECTED_RUN_FILES = [
-    "SRR27336825_1.fastq.gz",
-    "SRR27336826_1.fastq.gz",
-    "SRR27336827_1.fastq.gz",
-    "SRR27336828_1.fastq.gz",
-    "SRR27336829_1.fastq.gz",
-    "SRR27336830_1.fastq.gz",
-    "SRR27336831_1.fastq.gz",
-    "SRR27336832_1.fastq.gz",
-]
 SIZE_PATTERN = re.compile(r";size=(\d+);?$")
 
 
@@ -38,23 +28,24 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def ensure_executable(name: str) -> None:
-    if shutil.which(name) is None:
-        raise RuntimeError(f"Required executable not found in PATH: {name}")
+def resolve_executable(name: str) -> str:
+    env_bin = Path(sys.executable).resolve().parent / name
+    if env_bin.exists():
+        return str(env_bin)
+
+    resolved = shutil.which(name)
+    if resolved is None:
+        raise RuntimeError(f"Required executable not found in PATH or env bin: {name}")
+    return resolved
 
 
 def discover_inputs(data_dir: Path) -> list[Path]:
-    merged_file = data_dir / "SAMN27531837.fastq.gz"
-    if merged_file.exists():
-        print(f"Ignoring merged sample file: {merged_file}")
-
-    missing = [f for f in EXPECTED_RUN_FILES if not (data_dir / f).exists()]
-    if missing:
+    run_files = sorted(data_dir.rglob("*_1.fastq.gz"))
+    if not run_files:
         raise FileNotFoundError(
-            "Missing expected per-run forward FASTQs: " + ", ".join(missing)
+            f"No forward FASTQs matching '*_1.fastq.gz' found under {data_dir}"
         )
 
-    run_files = [data_dir / f for f in EXPECTED_RUN_FILES]
     empty = [str(fp) for fp in run_files if fp.stat().st_size == 0]
     if empty:
         raise RuntimeError("Input FASTQ(s) are empty: " + ", ".join(empty))
@@ -85,40 +76,48 @@ def fastq_to_trimmed_fasta(fastq_fp: Path, fasta_fp: Path, trim_length: int) -> 
     return kept
 
 
-def run_deblur_for_sample(fastq_fp: Path, work_dir: Path, trim_length: int, error_dist: str) -> Path:
+def run_deblur_for_sample(
+    fastq_fp: Path,
+    work_dir: Path,
+    trim_length: int,
+    error_dist: str,
+    deblur_exe: str,
+) -> Path:
     sample_id = fastq_fp.name.replace("_1.fastq.gz", "")
-    sample_out = work_dir / sample_id
+    sample_out = (work_dir / sample_id).resolve()
     sample_out.mkdir(parents=True, exist_ok=True)
 
-    fasta_fp = sample_out / f"{sample_id}.trim{trim_length}.fasta"
+    fasta_fp = (sample_out / f"{sample_id}.trim{trim_length}.fasta").resolve()
     kept_reads = fastq_to_trimmed_fasta(fastq_fp, fasta_fp, trim_length)
     print(f"  {sample_id}: converted {kept_reads} reads to trimmed FASTA", flush=True)
 
-    derep_fp = sample_out / f"{fasta_fp.name}.derep"
+    derep_fp = (sample_out / f"{fasta_fp.name}.derep").resolve()
     subprocess.run(
         [
-            "deblur",
+            deblur_exe,
             "dereplicate",
-            str(fasta_fp),
-            str(derep_fp),
+            fasta_fp.name,
+            derep_fp.name,
             "--min-size",
             "2",
         ],
         check=True,
+        cwd=sample_out,
     )
 
     subprocess.run(
         [
-            "deblur",
+            deblur_exe,
             "deblur-seqs",
-            str(derep_fp),
+            derep_fp.name,
             "--error-dist",
             error_dist,
         ],
         check=True,
+        cwd=sample_out,
     )
 
-    clean_fp = Path(str(derep_fp) + ".clean")
+    clean_fp = Path(str(derep_fp) + ".clean").resolve()
     if not clean_fp.exists():
         raise FileNotFoundError(f"Deblur clean output missing: {clean_fp}")
     return clean_fp
@@ -206,10 +205,13 @@ def write_outputs(feature_table: pd.DataFrame, dm, ord_res, results_dir: Path, m
 
 def main() -> int:
     args = parse_args()
-    ensure_executable("deblur")
-    ensure_executable("vsearch")
+    args.data_dir = args.data_dir.resolve()
+    args.work_dir = args.work_dir.resolve()
+    args.results_dir = args.results_dir.resolve()
+    deblur_exe = resolve_executable("deblur")
 
     inputs = discover_inputs(args.data_dir)
+    print(f"Discovered {len(inputs)} forward-read FASTQs under {args.data_dir}")
     args.work_dir.mkdir(parents=True, exist_ok=True)
 
     clean_fastas = {}
@@ -217,7 +219,7 @@ def main() -> int:
         print(f"Running Deblur for: {fp}", flush=True)
         sample_id = fp.name.replace("_1.fastq.gz", "")
         clean_fastas[sample_id] = run_deblur_for_sample(
-            fp, args.work_dir, args.trim_length, args.error_dist
+            fp, args.work_dir, args.trim_length, args.error_dist, deblur_exe
         )
 
     feature_table = build_feature_table(clean_fastas)
