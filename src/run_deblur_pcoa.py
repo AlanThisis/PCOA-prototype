@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 import argparse
 import gzip
 import re
@@ -7,10 +8,6 @@ import subprocess
 from collections import Counter
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-import pandas as pd
-from skbio.diversity import beta_diversity
-from skbio.stats.ordination import pcoa
 
 EXPECTED_RUN_FILES = [
     "SRR27336825_1.fastq.gz",
@@ -22,7 +19,7 @@ EXPECTED_RUN_FILES = [
     "SRR27336831_1.fastq.gz",
     "SRR27336832_1.fastq.gz",
 ]
-SIZE_PATTERN = re.compile(r";size=(\d+)$")
+SIZE_PATTERN = re.compile(r";size=(\d+);?$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -147,6 +144,8 @@ def parse_deblur_clean_fasta(clean_fp: Path) -> Counter:
 
 
 def build_feature_table(clean_fastas: dict[str, Path]) -> pd.DataFrame:
+    import pandas as pd
+
     by_sample = {}
     for sample_id, clean_fp in clean_fastas.items():
         by_sample[sample_id] = parse_deblur_clean_fasta(clean_fp)
@@ -163,6 +162,9 @@ def build_feature_table(clean_fastas: dict[str, Path]) -> pd.DataFrame:
 
 
 def compute_pcoa(feature_table: pd.DataFrame, metric: str):
+    from skbio.diversity import beta_diversity
+    from skbio.stats.ordination import pcoa
+
     ids = feature_table.index.tolist()
     matrix = feature_table.to_numpy(dtype=float)
     dm = beta_diversity(metric=metric, counts=matrix, ids=ids)
@@ -171,6 +173,9 @@ def compute_pcoa(feature_table: pd.DataFrame, metric: str):
 
 
 def write_outputs(feature_table: pd.DataFrame, dm, ord_res, results_dir: Path, metric: str) -> None:
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
     results_dir.mkdir(parents=True, exist_ok=True)
 
     feature_fp = results_dir / "feature_table.tsv"
