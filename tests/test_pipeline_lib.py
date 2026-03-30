@@ -1,41 +1,50 @@
+from __future__ import annotations
+
+import gzip
 from pathlib import Path
 
-from src.pipeline_lib import discover_inputs, parse_deblur_clean_fasta
+from pipeline_lib import fastq_to_trimmed_fasta, parse_deblur_clean_fasta
 
 
-def test_parse_deblur_clean_fasta_reads_size_with_trailing_semicolon(tmp_path: Path) -> None:
-    clean_fp = tmp_path / "sample.derep.clean"
+def test_fastq_to_trimmed_fasta_keeps_only_reads_at_trim_length(tmp_path: Path) -> None:
+    fastq_fp = tmp_path / "sample_1.fastq.gz"
+    fasta_fp = tmp_path / "trimmed.fasta"
+    trim_length = 5
+
+    with gzip.open(fastq_fp, "wt") as fout:
+        fout.write(
+            "@read_short\n"
+            "ACG\n"
+            "+\n"
+            "!!!\n"
+            "@read_exact\n"
+            "ACGTA\n"
+            "+\n"
+            "!!!!!\n"
+            "@read_long\n"
+            "ACGTACGT\n"
+            "+\n"
+            "!!!!!!!!\n"
+        )
+
+    kept = fastq_to_trimmed_fasta(fastq_fp, fasta_fp, trim_length)
+
+    assert kept == 2
+    assert fasta_fp.read_text() == ">read_exact\nACGTA\n>read_long\nACGTA\n"
+
+
+def test_parse_deblur_clean_fasta_parses_sizes_and_counts_last_sequence(tmp_path: Path) -> None:
+    clean_fp = tmp_path / "mock.clean"
     clean_fp.write_text(
-        ">seq1;size=7;\n"
+        ">seqA;size=4;\n"
         "ACGT\n"
-        ">seq2;size=3;\n"
+        ">seqB;size=2;\n"
         "TGCA\n"
-    )
-
-    counts = parse_deblur_clean_fasta(clean_fp)
-
-    assert counts["ACGT"] == 7
-    assert counts["TGCA"] == 3
-
-
-def test_parse_deblur_clean_fasta_counts_last_sequence_at_eof(tmp_path: Path) -> None:
-    clean_fp = tmp_path / "sample.derep.clean"
-    clean_fp.write_text(
-        ">seq1;size=5\n"
+        ">seqC;size=7;\n"
         "ACGT\n"
     )
 
     counts = parse_deblur_clean_fasta(clean_fp)
 
-    assert counts["ACGT"] == 5
-
-
-def test_discover_inputs_finds_all_forward_reads_recursively(tmp_path: Path) -> None:
-    sample_dir = tmp_path / "PRJNA825639"
-    sample_dir.mkdir()
-    for name in ("SRR1_1.fastq.gz", "SRR2_1.fastq.gz", "SRR1_2.fastq.gz"):
-        (sample_dir / name).write_text("x")
-
-    inputs = discover_inputs(tmp_path)
-
-    assert [p.name for p in inputs] == ["SRR1_1.fastq.gz", "SRR2_1.fastq.gz"]
+    assert counts["ACGT"] == 11
+    assert counts["TGCA"] == 2
