@@ -1,30 +1,37 @@
 from __future__ import annotations
 
-from collections import Counter
 from pathlib import Path
+import sys
+from types import SimpleNamespace
 
+import pandas as pd
+import pytest
+
+import build_table
 from build_table import build_feature_table
 
 
-def test_build_feature_table_with_overlapping_and_unique_features(
-    tmp_path: Path, monkeypatch
-) -> None:
-    clean_a = tmp_path / "sampleA.trim250.fasta.derep.clean"
-    clean_b = tmp_path / "sampleB.trim250.fasta.derep.clean"
-    clean_a.write_text("placeholder\n")
-    clean_b.write_text("placeholder\n")
+class FakeBiomTable:
+    def __init__(self, feature_by_sample: pd.DataFrame) -> None:
+        self._feature_by_sample = feature_by_sample
 
-    counters = {
-        clean_a: Counter({"AAAA": 3, "CCCC": 1}),
-        clean_b: Counter({"AAAA": 2, "GGGG": 5}),
-    }
+    def to_dataframe(self, dense: bool = True) -> pd.DataFrame:
+        assert dense is True
+        return self._feature_by_sample.transpose()
 
-    def fake_parse(clean_fp: Path) -> Counter[str]:
-        return counters[clean_fp]
 
-    monkeypatch.setattr("build_table.parse_deblur_clean_fasta", fake_parse)
-
-    table = build_feature_table([clean_a, clean_b])
+def test_build_feature_table_from_biom_with_overlapping_and_unique_features() -> None:
+    biom_table = FakeBiomTable(
+        pd.DataFrame(
+            {
+                "AAAA": [3, 2],
+                "CCCC": [1, 0],
+                "GGGG": [0, 5],
+            },
+            index=["sampleA", "sampleB"],
+        )
+    )
+    table = build_feature_table(biom_table)
 
     assert table.shape == (2, 3)
     assert table.index.name == "sample_id"
@@ -37,3 +44,29 @@ def test_build_feature_table_with_overlapping_and_unique_features(
     assert table.loc["sampleB", "AAAA"] == 2
     assert table.loc["sampleB", "CCCC"] == 0
     assert table.loc["sampleB", "GGGG"] == 5
+
+
+def test_load_biom_table_raises_helpful_error_when_biom_missing(tmp_path: Path) -> None:
+    biom_fp = tmp_path / "all.biom"
+    biom_fp.write_text("placeholder")
+
+    with pytest.raises(RuntimeError, match="requires the 'biom' package"):
+        build_table.load_biom_table(biom_fp)
+
+
+def test_load_biom_table_calls_biom_load_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    called = {}
+
+    def fake_load_table(path: str) -> str:
+        called["path"] = path
+        return "fake-table"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "biom",
+        SimpleNamespace(load_table=fake_load_table),
+    )
+
+    table = build_table.load_biom_table(Path("work/deblur/workflow/all.biom"))
+    assert table == "fake-table"
+    assert called["path"].endswith("work/deblur/workflow/all.biom")

@@ -67,10 +67,9 @@ It does not do paired-end merging or subsampling.
 1. `run_deblur.py` recursively discovers forward reads matching `*_1.fastq.gz` under the input directory.
 2. `run_deblur.py` stages each discovered run through `fastp` into `work/deblur/fastp/`.
 3. `run_deblur.py` calls `deblur workflow` once on that staged directory. The primary Deblur artifact is `work/deblur/workflow/all.biom`.
-4. `build_table.py` is currently incompatible with the refactored `run_deblur.py`, because it still expects per-sample `.clean` files rather than Deblur workflow BIOM output.
-5. `diversity.py` is therefore also currently incompatible with the refactored `run_deblur.py`, because it depends on `build_table.py` producing `results/forward_only/feature_table.tsv`.
-6. Once `build_table.py` is updated or replaced, `diversity.py` will still compute beta diversity (default: `braycurtis`) and run PCoA from the resulting feature table.
-7. `diversity.py` writes tabular outputs and a PNG plot.
+4. `build_table.py` reads `work/deblur/workflow/all.biom` and writes `results/forward_only/feature_table.tsv` with sample IDs as rows and feature sequences as columns.
+5. `diversity.py` computes beta diversity (default: `braycurtis`) and runs PCoA from `results/forward_only/feature_table.tsv`.
+6. `diversity.py` writes tabular outputs and a PNG plot.
 
 ### Outputs
 
