@@ -24,10 +24,15 @@ def resolve_executable(name: str) -> str:
 
 
 def discover_inputs(data_dir: Path) -> list[Path]:
-    run_files = sorted(data_dir.rglob("*_1.fastq.gz"))
+    patterns = ("*_1.fastq.gz", "*_R1_001.fastq.gz")
+    discovered: set[Path] = set()
+    for pattern in patterns:
+        discovered.update(data_dir.rglob(pattern))
+    run_files = sorted(discovered)
     if not run_files:
         raise FileNotFoundError(
-            f"No forward FASTQs matching '*_1.fastq.gz' found under {data_dir}"
+            "No forward FASTQs matching '*_1.fastq.gz' or '*_R1_001.fastq.gz' "
+            f"found under {data_dir}"
         )
 
     empty = [str(fp) for fp in run_files if fp.stat().st_size == 0]

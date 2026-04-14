@@ -55,7 +55,7 @@ def main() -> int:
         ax.annotate(sample_id, (xv, yv), fontsize=8)
     ax.set_xlabel(f"PC1 ({ord_res.proportion_explained['PC1'] * 100:.2f}%)")
     ax.set_ylabel(f"PC2 ({ord_res.proportion_explained['PC2'] * 100:.2f}%)")
-    ax.set_title("PCoA (forward-only Deblur table)")
+    ax.set_title("PCoA (Bray-Curtis from Deblur feature table)")
     fig.tight_layout()
     fig.savefig(plot_fp, dpi=150)
 

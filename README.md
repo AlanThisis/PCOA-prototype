@@ -5,8 +5,8 @@ A prototype project to process ENA 16S forward reads, denoise with Deblur, and g
 ## Tooling
 
 - `fastq-dl` for downloading FASTQ data from ENA
-- `seqkit` for read utilities
 - `deblur` for QC / denoising
+- `biom` for converting BIOM feature tables to TSV
 - `scikit-bio` for distance metrics and PCoA analysis
 
 ## Environment setup
@@ -30,9 +30,8 @@ Check that the main tools resolve correctly:
 
 ```bash
 fastq-dl --help
-fastp --help
-seqkit version
 deblur --help
+biom --help
 python -c "import skbio; print(skbio.__version__)"
 ```
 
@@ -48,6 +47,14 @@ python src/build_table.py
 python src/diversity.py
 ```
 
+Use `--work-dir` and `--results-dir` when running multiple experiments side-by-side:
+
+```bash
+python src/run_deblur.py --data-dir data/demux_moving_picture --work-dir work/deblur_moving_picture --trim-length 120
+python src/build_table.py --work-dir work/deblur_moving_picture --results-dir results/moving_picture
+python src/diversity.py --results-dir results/moving_picture --metric braycurtis
+```
+
 If you are not already inside an activated Conda shell, run it explicitly with the environment interpreter:
 
 ```bash
@@ -58,30 +65,54 @@ If you are not already inside an activated Conda shell, run it explicitly with t
 
 ### Inputs used
 
-The pipeline recursively scans the supplied `--data-dir` and uses every file matching `*_1.fastq.gz` as a forward-read sample input. Reverse reads like `*_2.fastq.gz` are ignored. This works whether the FASTQs are directly under `data/` or nested under a study subdirectory such as `data/PRJNA825639/`.
+The pipeline recursively scans the supplied `--data-dir` and uses forward-read sample FASTQs matching either `*_1.fastq.gz` (ENA-style) or `*_R1_001.fastq.gz` (demux-export style). Reverse reads like `*_2.fastq.gz` are ignored. This works whether the FASTQs are directly under `data/` or nested under a study subdirectory.
 
 It does not do paired-end merging or subsampling.
 
 ### What the scripts do
 
-1. `run_deblur.py` recursively discovers forward reads matching `*_1.fastq.gz` under the input directory.
-2. `run_deblur.py` stages each discovered run through `fastp` into `work/deblur/fastp/`.
-3. `run_deblur.py` calls `deblur workflow` once on that staged directory. The primary Deblur artifact is `work/deblur/workflow/all.biom`.
-4. `build_table.py` is currently incompatible with the refactored `run_deblur.py`, because it still expects per-sample `.clean` files rather than Deblur workflow BIOM output.
-5. `diversity.py` is therefore also currently incompatible with the refactored `run_deblur.py`, because it depends on `build_table.py` producing `results/forward_only/feature_table.tsv`.
-6. Once `build_table.py` is updated or replaced, `diversity.py` will still compute beta diversity (default: `braycurtis`) and run PCoA from the resulting feature table.
+1. `run_deblur.py` recursively discovers forward reads matching `*_1.fastq.gz` or `*_R1_001.fastq.gz` under the input directory.
+2. `run_deblur.py` calls `deblur workflow` directly on that directory.
+3. The primary Deblur artifact is `work/deblur/workflow/all.biom`.
+4. `build_table.py` converts `all.biom` to a sample x feature TSV (`results/forward_only/feature_table.tsv`) using `biom convert`.
+5. `build_table.py` normalizes demux-style sample IDs by removing lane/run suffixes (for example `L5S222_17_L001_R1_001` to `L5S222`).
+6. `diversity.py` computes beta diversity (default: `braycurtis`) and runs PCoA from the feature table.
 7. `diversity.py` writes tabular outputs and a PNG plot.
 
 ### Outputs
 
 - Working outputs: `work/deblur/`
-  - `fastp/` staged forward-read files
   - `workflow/` Deblur outputs including `all.biom`, `all.seqs.fa`, and workflow metadata/logs
 - Final outputs: `results/forward_only/`
   - `feature_table.tsv`
   - `distance_matrix_braycurtis.tsv`
   - `pcoa_coordinates.tsv`
   - `pcoa_plot.png`
+
+### File usage quick guide
+
+- `work/.../workflow/all.biom`
+  - Primary Deblur output (feature table in BIOM format).
+  - Use this when you want to re-export tables or compare Deblur runs.
+- `results/.../feature_table.tsv`
+  - Sample x feature matrix used by `diversity.py`.
+  - This is the direct input for scikit-bio beta-diversity/PCoA in this repo.
+- `results/.../distance_matrix_braycurtis.tsv`
+  - Pairwise sample dissimilarity matrix used to derive PCoA coordinates.
+- `results/.../pcoa_coordinates.tsv`
+  - Coordinates for each sample (PC1, PC2, ...); use this for custom plotting or metadata joins.
+- `results/.../pcoa_plot.png`
+  - Static quick-look visualization of the ordination.
+
+For QIIME artifact comparisons:
+
+- `data/moving_picture/table.qza` is the post-Deblur feature table (best match to this pipeline's pre-diversity output).
+- `data/moving_picture/diversity-core-metrics-phylogenetic/rarefied_table.qza` is post-rarefaction for core-metrics (not directly equivalent to unrarefied pipeline output).
+
+Metadata note:
+
+- Feature tables do not contain body site / month / intervention labels.
+- Join `pcoa_coordinates.tsv` or `feature_table.tsv` to metadata by sample ID (for moving picture: `data/moving_picture/sample-metadata.tsv`).
 
 ## Notes
 

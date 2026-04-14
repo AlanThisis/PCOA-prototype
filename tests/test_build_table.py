@@ -1,39 +1,40 @@
 from __future__ import annotations
 
-from collections import Counter
 from pathlib import Path
 
-from build_table import build_feature_table
+from build_table import build_feature_table_from_biom, normalize_sample_id
 
 
-def test_build_feature_table_with_overlapping_and_unique_features(
+def test_normalize_sample_id_strips_demux_suffix() -> None:
+    assert normalize_sample_id("L5S222_17_L001_R1_001") == "L5S222"
+    assert normalize_sample_id("SRR27336825_1") == "SRR27336825_1"
+
+
+def test_build_feature_table_from_biom_groups_normalized_samples(
     tmp_path: Path, monkeypatch
 ) -> None:
-    clean_a = tmp_path / "sampleA.trim250.fasta.derep.clean"
-    clean_b = tmp_path / "sampleB.trim250.fasta.derep.clean"
-    clean_a.write_text("placeholder\n")
-    clean_b.write_text("placeholder\n")
+    biom_fp = tmp_path / "all.biom"
+    biom_fp.write_text("placeholder\n")
 
-    counters = {
-        clean_a: Counter({"AAAA": 3, "CCCC": 1}),
-        clean_b: Counter({"AAAA": 2, "GGGG": 5}),
-    }
+    def fake_convert_biom_to_tsv(
+        _biom_fp: Path, tsv_fp: Path, _biom_executable_path: str
+    ) -> None:
+        tsv_fp.write_text(
+            "# Constructed from biom file\n"
+            "#OTU ID\tL5S222_17_L001_R1_001\tL5S222_18_L001_R1_001\tL2S309_33_L001_R1_001\n"
+            "feat_b\t2\t1\t0\n"
+            "feat_a\t3\t4\t5\n"
+        )
 
-    def fake_parse(clean_fp: Path) -> Counter[str]:
-        return counters[clean_fp]
+    monkeypatch.setattr("build_table.convert_biom_to_tsv", fake_convert_biom_to_tsv)
 
-    monkeypatch.setattr("build_table.parse_deblur_clean_fasta", fake_parse)
+    table = build_feature_table_from_biom(biom_fp, "/env/bin/biom")
 
-    table = build_feature_table([clean_a, clean_b])
-
-    assert table.shape == (2, 3)
     assert table.index.name == "sample_id"
-    assert table.columns.name == "feature_sequence"
-    assert list(table.index) == ["sampleA", "sampleB"]
-    assert list(table.columns) == ["AAAA", "CCCC", "GGGG"]
-    assert table.loc["sampleA", "AAAA"] == 3
-    assert table.loc["sampleA", "CCCC"] == 1
-    assert table.loc["sampleA", "GGGG"] == 0
-    assert table.loc["sampleB", "AAAA"] == 2
-    assert table.loc["sampleB", "CCCC"] == 0
-    assert table.loc["sampleB", "GGGG"] == 5
+    assert table.columns.name == "feature_id"
+    assert list(table.index) == ["L2S309", "L5S222"]
+    assert list(table.columns) == ["feat_a", "feat_b"]
+    assert table.loc["L5S222", "feat_a"] == 7
+    assert table.loc["L5S222", "feat_b"] == 3
+    assert table.loc["L2S309", "feat_a"] == 5
+    assert table.loc["L2S309", "feat_b"] == 0
