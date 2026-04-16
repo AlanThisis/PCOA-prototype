@@ -6,7 +6,7 @@ A prototype project to process ENA 16S forward reads, denoise with Deblur, and g
 
 - `fastq-dl` for downloading FASTQ data from ENA
 - `deblur` for QC / denoising
-- `biom` for converting BIOM feature tables to TSV
+- `biom-format` Python package for reading BIOM feature tables
 - `scikit-bio` for distance metrics and PCoA analysis
 
 ## Environment setup
@@ -74,7 +74,7 @@ It does not do paired-end merging or subsampling.
 1. `run_deblur.py` recursively discovers forward reads matching `*_1.fastq.gz` or `*_R1_001.fastq.gz` under the input directory.
 2. `run_deblur.py` calls `deblur workflow` directly on that directory.
 3. The primary Deblur artifact is `work/deblur/workflow/all.biom`.
-4. `build_table.py` converts `all.biom` to a sample x feature TSV (`results/forward_only/feature_table.tsv`) using `biom convert`.
+4. `build_table.py` reads `all.biom` via `biom.load_table` and writes a sample x feature TSV (`results/forward_only/feature_table.tsv`).
 5. `build_table.py` normalizes demux-style sample IDs by removing lane/run suffixes (for example `L5S222_17_L001_R1_001` to `L5S222`).
 6. `diversity.py` computes beta diversity (default: `braycurtis`) and runs PCoA from the feature table.
 7. `diversity.py` writes tabular outputs and a PNG plot.

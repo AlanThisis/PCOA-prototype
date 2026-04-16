@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import sys
+import types
 from pathlib import Path
 
-from build_table import build_feature_table_from_biom, normalize_sample_id
+import pandas as pd
+
+from build_table import (
+    build_feature_table_from_biom,
+    normalize_sample_id,
+    read_feature_table_from_biom,
+)
 
 
 def test_normalize_sample_id_strips_demux_suffix() -> None:
@@ -16,19 +24,23 @@ def test_build_feature_table_from_biom_groups_normalized_samples(
     biom_fp = tmp_path / "all.biom"
     biom_fp.write_text("placeholder\n")
 
-    def fake_convert_biom_to_tsv(
-        _biom_fp: Path, tsv_fp: Path, _biom_executable_path: str
-    ) -> None:
-        tsv_fp.write_text(
-            "# Constructed from biom file\n"
-            "#OTU ID\tL5S222_17_L001_R1_001\tL5S222_18_L001_R1_001\tL2S309_33_L001_R1_001\n"
-            "feat_b\t2\t1\t0\n"
-            "feat_a\t3\t4\t5\n"
-        )
+    source_table = pd.DataFrame(
+        {
+            "L5S222_17_L001_R1_001": {"feat_b": 2, "feat_a": 3},
+            "L5S222_18_L001_R1_001": {"feat_b": 1, "feat_a": 4},
+            "L2S309_33_L001_R1_001": {"feat_b": 0, "feat_a": 5},
+        }
+    )
 
-    monkeypatch.setattr("build_table.convert_biom_to_tsv", fake_convert_biom_to_tsv)
+    def fake_read_feature_table_from_biom(_biom_fp: Path) -> pd.DataFrame:
+        return source_table.T
 
-    table = build_feature_table_from_biom(biom_fp, "/env/bin/biom")
+    monkeypatch.setattr(
+        "build_table.read_feature_table_from_biom",
+        fake_read_feature_table_from_biom,
+    )
+
+    table = build_feature_table_from_biom(biom_fp)
 
     assert table.index.name == "sample_id"
     assert table.columns.name == "feature_id"
@@ -38,3 +50,28 @@ def test_build_feature_table_from_biom_groups_normalized_samples(
     assert table.loc["L5S222", "feat_b"] == 3
     assert table.loc["L2S309", "feat_a"] == 5
     assert table.loc["L2S309", "feat_b"] == 0
+
+
+def test_read_feature_table_from_biom_uses_load_table(monkeypatch) -> None:
+    class FakeBiomTable:
+        def to_dataframe(self, dense: bool = False) -> pd.DataFrame:
+            assert dense is True
+            return pd.DataFrame(
+                {
+                    "sample_a": {"feat_x": 1, "feat_y": 2},
+                    "sample_b": {"feat_x": 0, "feat_y": 3},
+                }
+            )
+
+    def fake_load_table(path: str):
+        assert path == "/tmp/mock.biom"
+        return FakeBiomTable()
+
+    fake_biom_module = types.SimpleNamespace(load_table=fake_load_table)
+    monkeypatch.setitem(sys.modules, "biom", fake_biom_module)
+
+    table = read_feature_table_from_biom(Path("/tmp/mock.biom"))
+
+    assert list(table.index) == ["sample_a", "sample_b"]
+    assert list(table.columns) == ["feat_x", "feat_y"]
+    assert table.loc["sample_a", "feat_y"] == 2

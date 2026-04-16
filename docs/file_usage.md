@@ -21,7 +21,7 @@ This document explains how to use key pipeline files and artifacts.
 ## Table outputs (`build_table.py`)
 
 - `results/<run_name>/feature_table.tsv`
-  - Sample x feature matrix exported from `all.biom`.
+  - Sample x feature matrix exported from `all.biom` via Python `biom.load_table`.
   - Demux sample IDs are normalized by removing lane/run suffixes:
     - `L5S222_17_L001_R1_001` -> `L5S222`
 
