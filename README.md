@@ -47,6 +47,18 @@ python src/build_table.py
 python src/diversity.py
 ```
 
+To shortlist candidate studies from `data/MMC_final_data.csv` before downloading and running Deblur:
+
+```bash
+python src/select_study_candidates.py \
+  --csv data/MMC_final_data.csv \
+  --min-sample-size 100 \
+  --storage-cap-gb 20 \
+  --max-pmc-checks 50 \
+  --random-seed 42 \
+  --entrez-rpm 5
+```
+
 Use `--work-dir` and `--results-dir` when running multiple experiments side-by-side:
 
 ```bash

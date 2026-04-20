@@ -1,7 +1,5 @@
 # Downloaded inputs and metadata
-data/*
-!data/PRJNA825639/
-!data/PRJNA825639/**
+data/
 
 # Python bytecode and caches
 __pycache__/
