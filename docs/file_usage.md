@@ -47,3 +47,15 @@ This document explains how to use key pipeline files and artifacts.
 - Biological labels (body site, month, subject, intervention) come from metadata, not from feature tables.
 - Use sample ID as join key:
   - moving picture metadata file: `data/moving_picture/sample-metadata.tsv`
+
+## PRJEB44533 organization and subsampling
+
+- Study layout:
+  - `data/fastq_data/PRJEB44533/full/`: original FASTQ files
+  - `data/fastq_data/PRJEB44533/subsample_50/`: forward-read 50% subset
+  - `data/fastq_data/PRJEB44533/subsample_25/`: forward-read 25% subset
+  - `data/fastq_data/PRJEB44533/PRJEB44533-run-info.tsv`: unchanged study metadata
+- `src/subsample_fastq.py`:
+  - Discovers forward FASTQs recursively (`*_1.fastq.gz`, `*_R1_001.fastq.gz`)
+  - Runs `seqkit sample2` with fixed seed and `-2` (`--two-pass`)
+  - Writes subsampled outputs with the same FASTQ basenames

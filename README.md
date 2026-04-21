@@ -129,3 +129,39 @@ Metadata note:
 ## Notes
 
 This is the first-pass reproducible implementation and is intentionally minimal so future work can branch into paired-end workflows, subsampling comparisons, richer metadata integration, and alternative distance metrics.
+
+## PRJEB44533 Subsampling
+
+Use `src/subsample_fastq.py` to subsample forward reads (`*_1.fastq.gz` or `*_R1_001.fastq.gz`) with `seqkit sample2` in two-pass mode.
+
+Expected PRJEB44533 layout:
+
+```text
+data/fastq_data/PRJEB44533/
+  PRJEB44533-run-info.tsv
+  full/
+  subsample_50/
+  subsample_25/
+```
+
+Example commands:
+
+```bash
+conda run -n qiime2-amplicon-2026.1 \
+  python src/subsample_fastq.py \
+  --input-dir data/fastq_data/PRJEB44533/full \
+  --output-dir data/fastq_data/PRJEB44533/subsample_50 \
+  --percent 50 \
+  --seed 11
+
+conda run -n qiime2-amplicon-2026.1 \
+  python src/subsample_fastq.py \
+  --input-dir data/fastq_data/PRJEB44533/full \
+  --output-dir data/fastq_data/PRJEB44533/subsample_25 \
+  --percent 25 \
+  --seed 11
+```
+
+Implementation detail:
+
+- `subsample_fastq.py` always calls `seqkit sample2` with `-2` (`--two-pass`) for stable fraction sampling on large FASTQ files.
