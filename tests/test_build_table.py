@@ -15,7 +15,9 @@ from build_table import (
 
 def test_normalize_sample_id_strips_demux_suffix() -> None:
     assert normalize_sample_id("L5S222_17_L001_R1_001") == "L5S222"
-    assert normalize_sample_id("SRR27336825_1") == "SRR27336825_1"
+    assert normalize_sample_id("SRR27336825_1") == "SRR27336825"
+    assert normalize_sample_id("ERR10317641_2") == "ERR10317641"
+    assert normalize_sample_id("custom_sample_1") == "custom_sample_1"
 
 
 def test_build_feature_table_from_biom_groups_normalized_samples(

@@ -9,6 +9,7 @@ import pandas as pd
 
 
 SAMPLE_SUFFIX_PATTERN = re.compile(r"_[0-9]+_L[0-9]{3}_R[12]_[0-9]{3}$")
+ENA_READ_SUFFIX_PATTERN = re.compile(r"^(?P<accession>[EDS]RR[0-9]+)_[12]$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -22,7 +23,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def normalize_sample_id(sample_id: str) -> str:
-    return SAMPLE_SUFFIX_PATTERN.sub("", sample_id)
+    demux_normalized = SAMPLE_SUFFIX_PATTERN.sub("", sample_id)
+    ena_match = ENA_READ_SUFFIX_PATTERN.match(demux_normalized)
+    if ena_match:
+        return ena_match.group("accession")
+    return demux_normalized
 
 
 def read_feature_table_from_biom(biom_fp: Path) -> pd.DataFrame:
