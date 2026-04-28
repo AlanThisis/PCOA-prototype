@@ -130,6 +130,11 @@ Metadata note:
 
 This is the first-pass reproducible implementation and is intentionally minimal so future work can branch into paired-end workflows, subsampling comparisons, richer metadata integration, and alternative distance metrics.
 
+Deblur defaults used by `run_deblur.py` are standardized as:
+
+- `--trim-length 150`
+- `--min-reads 0` to disable the final cross-sample abundance filter and keep per-sample denoising independent
+
 ## PRJEB44533 Subsampling
 
 Use `src/subsample_fastq.py` to subsample forward reads (`*_1.fastq.gz` or `*_R1_001.fastq.gz`) with `seqkit sample2` in two-pass mode.
