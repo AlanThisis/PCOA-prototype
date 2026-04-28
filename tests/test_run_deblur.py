@@ -50,13 +50,22 @@ def test_parse_args_parses_jobs_to_start(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(
         sys,
         "argv",
-        ["run_deblur.py", "--jobs-to-start", "4", "--trim-length", "200"],
+        [
+            "run_deblur.py",
+            "--jobs-to-start",
+            "4",
+            "--trim-length",
+            "200",
+            "--min-reads",
+            "0",
+        ],
     )
 
     args = parse_args()
 
     assert args.jobs_to_start == 4
     assert args.trim_length == 200
+    assert args.min_reads == 0
 
 
 def test_run_deblur_workflow_builds_expected_command(
@@ -80,6 +89,7 @@ def test_run_deblur_workflow_builds_expected_command(
         work_dir,
         250,
         "1,0.06,0.02",
+        0,
         3,
         "/env/bin/deblur",
     )
@@ -98,6 +108,8 @@ def test_run_deblur_workflow_builds_expected_command(
                 "250",
                 "--error-dist",
                 "1,0.06,0.02",
+                "--min-reads",
+                "0",
                 "--jobs-to-start",
                 "3",
                 "--keep-tmp-files",

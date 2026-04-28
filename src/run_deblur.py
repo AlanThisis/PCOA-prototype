@@ -15,10 +15,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--work-dir", type=Path, default=Path("work/deblur"))
-    parser.add_argument("--trim-length", type=int, default=250)
+    parser.add_argument("--trim-length", type=int, default=150)
     parser.add_argument(
         "--error-dist",
         default="1,0.06,0.02,0.02,0.01,0.005,0.005,0.005,0.001,0.001,0.001,0.0005",
+    )
+    parser.add_argument(
+        "--min-reads",
+        type=int,
+        default=0,
+        help=(
+            "Retain only features observed at least this many times across all "
+            "samples. Use 0 to disable cross-sample filtering."
+        ),
     )
     parser.add_argument("--jobs-to-start", type=int, default=1)
     return parser.parse_args()
@@ -29,6 +38,7 @@ def run_deblur_workflow(
     work_dir: Path,
     trim_length: int,
     error_dist: str,
+    min_reads: int,
     jobs_to_start: int,
     deblur_executable_path: str,
 ) -> Path:
@@ -45,6 +55,8 @@ def run_deblur_workflow(
             str(trim_length),
             "--error-dist",
             error_dist,
+            "--min-reads",
+            str(min_reads),
             "--jobs-to-start",
             str(jobs_to_start),
             "--keep-tmp-files",
@@ -102,6 +114,7 @@ def main() -> int:
             args.work_dir,
             args.trim_length,
             args.error_dist,
+            args.min_reads,
             args.jobs_to_start,
             deblur_executable_path,
         )
