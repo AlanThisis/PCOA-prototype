@@ -32,7 +32,7 @@ import skbio
 from pipeline_lib import resolve_executable, run_command
 
 
-GG2_BACKBONE_FILENAME = "2024.09.backbone.v4.fna.qza"
+GG2_BACKBONE_FILENAME = "2024.09.backbone.full-length.fna.qza"
 GG2_ID_TREE_FILENAME = "2024.09.phylogeny.id.nwk.qza"
 GG2_FTP_BASE = "https://ftp.microbio.me/greengenes_release/current/"
 
