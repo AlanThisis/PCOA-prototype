@@ -2,6 +2,7 @@ name: pcoa-prototype
 dependencies:
   - fastq-dl
   - deblur
+  - biom-format
   - matplotlib
   - pandas
   - pytest

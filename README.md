@@ -11,9 +11,10 @@ A prototype project to process ENA 16S forward reads, denoise with Deblur, and g
 
 ## Environment setup
 
-The repository's `environment.yml` is exported from the solved Conda environment, not maintained by hand.
+The `pcoa-prototype` conda environment covers Deblur, BIOM, scikit-bio, and plotting.
+The UniFrac step additionally requires a [QIIME2 amplicon environment](https://docs.qiime2.org/2024.10/install/) with the [q2-greengenes2 plugin](https://github.com/biocore/q2-greengenes2) installed — any recent QIIME2 amplicon distribution will work.
 
-Create the environment from the repository root:
+Create the pcoa-prototype environment from the repository root:
 
 ```bash
 conda env create -f environment.yml
@@ -47,18 +48,6 @@ python src/build_table.py
 python src/diversity.py
 ```
 
-To shortlist candidate studies from `data/MMC_final_data.csv` before downloading and running Deblur:
-
-```bash
-python src/select_study_candidates.py \
-  --csv data/MMC_final_data.csv \
-  --min-sample-size 100 \
-  --storage-cap-gb 20 \
-  --max-pmc-checks 50 \
-  --random-seed 42 \
-  --entrez-rpm 5
-```
-
 Use `--work-dir` and `--results-dir` when running multiple experiments side-by-side:
 
 ```bash
@@ -67,13 +56,6 @@ python src/build_table.py --work-dir work/deblur_moving_picture --results-dir re
 python src/diversity.py --results-dir results/moving_picture --metric braycurtis
 ```
 
-If you are not already inside an activated Conda shell, run it explicitly with the environment interpreter:
-
-```bash
-/opt/conda/envs/pcoa-prototype/bin/python src/run_deblur.py --data-dir data
-/opt/conda/envs/pcoa-prototype/bin/python src/build_table.py
-/opt/conda/envs/pcoa-prototype/bin/python src/diversity.py
-```
 
 ### Inputs used
 
@@ -116,15 +98,10 @@ It does not do paired-end merging or subsampling.
 - `results/.../pcoa_plot.png`
   - Static quick-look visualization of the ordination.
 
-For QIIME artifact comparisons:
-
-- `data/moving_picture/table.qza` is the post-Deblur feature table (best match to this pipeline's pre-diversity output).
-- `data/moving_picture/diversity-core-metrics-phylogenetic/rarefied_table.qza` is post-rarefaction for core-metrics (not directly equivalent to unrarefied pipeline output).
-
 Metadata note:
 
-- Feature tables do not contain body site / month / intervention labels.
-- Join `pcoa_coordinates.tsv` or `feature_table.tsv` to metadata by sample ID (for moving picture: `data/moving_picture/sample-metadata.tsv`).
+- Feature tables do not contain disease/group labels.
+- Join `pcoa_coordinates.tsv` or `feature_table.tsv` to a metadata TSV by sample ID.
 
 ## Notes
 
@@ -152,15 +129,13 @@ data/fastq_data/PRJEB44533/
 Example commands:
 
 ```bash
-conda run -n qiime2-amplicon-2026.1 \
-  python src/subsample_fastq.py \
+python src/subsample_fastq.py \
   --input-dir data/fastq_data/PRJEB44533/full \
   --output-dir data/fastq_data/PRJEB44533/subsample_50 \
   --percent 50 \
   --seed 11
 
-conda run -n qiime2-amplicon-2026.1 \
-  python src/subsample_fastq.py \
+python src/subsample_fastq.py \
   --input-dir data/fastq_data/PRJEB44533/full \
   --output-dir data/fastq_data/PRJEB44533/subsample_25 \
   --percent 25 \

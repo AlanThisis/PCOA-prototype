@@ -2,12 +2,12 @@
 """Run UniFrac phylogenetic diversity analysis using Greengenes2 and QIIME2.
 
 Requires:
-  - QIIME2 amplicon environment active (qiime2-amplicon-2026.1)
-  - q2-greengenes2 plugin installed in that environment
+  - A QIIME2 amplicon environment with q2-greengenes2 installed
+    (see https://docs.qiime2.org and https://github.com/biocore/q2-greengenes2)
 
 One-time GG2 artifact downloads (~175 MB total):
   mkdir -p data/gg2
-  wget -P data/gg2 https://ftp.microbio.me/greengenes_release/current/2024.09.backbone.v4.fna.qza
+  wget -P data/gg2 https://ftp.microbio.me/greengenes_release/current/2024.09.backbone.full-length.fna.qza
   wget -P data/gg2 https://ftp.microbio.me/greengenes_release/current/2024.09.phylogeny.id.nwk.qza
 
 Approach:
