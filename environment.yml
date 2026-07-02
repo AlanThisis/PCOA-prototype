@@ -5,6 +5,7 @@ dependencies:
   - matplotlib
   - pandas
   - pytest
+  - requests
   - python=3.11
   - scikit-bio
   - seqkit
