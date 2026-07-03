@@ -2,7 +2,6 @@ channels:
   - bioconda
   - conda-forge
 dependencies:
-  - fastq-dl
   - joblib
   - msgpack-python
   - nltk

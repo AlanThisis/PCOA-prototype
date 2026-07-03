@@ -30,6 +30,7 @@ esac
 conda env update --name "${ENV_NAME}" --file environment.yml
 conda run --name "${ENV_NAME}" python -m pip install --force-reinstall --no-deps setuptools==80.9.0
 conda run --name "${ENV_NAME}" python -c "import pkg_resources; print('pkg_resources OK')"
+conda run --name "${ENV_NAME}" python -m pip install fastq-dl==4.0.1
 conda run --name "${ENV_NAME}" python -m pip install --no-deps redbiom==0.3.9 q2-greengenes2==2024.1
 
 conda run --name "${ENV_NAME}" qiime info

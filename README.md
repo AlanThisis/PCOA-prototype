@@ -4,13 +4,13 @@ A prototype project to process ENA 16S forward reads, denoise with Deblur, and g
 
 ## Environment setup
 
-This pipeline runs inside a single [QIIME2 Rachis environment](https://library.qiime2.org/quickstart/qiime2). QIIME2 supplies Deblur, BIOM, scikit-bio, seqkit, matplotlib, pandas, requests, vsearch, and UniFrac support. This repo adds two missing pieces: `fastq-dl` for ENA downloads and `q2-greengenes2` for Greengenes2-backed UniFrac.
+This pipeline runs inside a single [QIIME2 Rachis environment](https://library.qiime2.org/quickstart/qiime2). QIIME2 supplies Deblur, BIOM, scikit-bio, seqkit, matplotlib, pandas, requests, vsearch, and UniFrac support. This repo adds `fastq-dl` for ENA downloads and `q2-greengenes2` for Greengenes2-backed UniFrac.
 
 The environment is assembled in three layers:
 
 1. Official QIIME2 Rachis conda environment. Treat this as the base because QIIME2 pins a large stack of Python, compiled, R, and plugin dependencies.
-2. Repo extras from `environment.yml`. This adds non-QIIME tools and helper dependencies, including `fastq-dl`, `joblib`, `msgpack-python`, and `nltk`.
-3. Greengenes2 plugin via `pip --no-deps`. `q2-greengenes2` and `redbiom` are installed without dependency resolution so pip does not replace QIIME2's conda-managed packages such as `scikit-bio`.
+2. Repo extras from `environment.yml`. This adds small helper dependencies, including `joblib`, `msgpack-python`, `nltk`, and a pinned `setuptools` compatible with the current Greengenes2 plugin.
+3. Pip-installed tools. `fastq-dl==4.0.1` is installed with pip because conda solving for it inside the QIIME2 2026.4 Codespace env can be killed by the solver. `q2-greengenes2` and `redbiom` are installed with `pip --no-deps` so pip does not replace QIIME2's conda-managed packages such as `scikit-bio`.
 
 This is intentionally not a fully hand-written conda YAML for every package. A custom all-in-one YAML is more fragile because QIIME2's distribution packages need to stay internally consistent.
 
@@ -51,8 +51,11 @@ If QIIME2 is already installed, update that env with the repo extras. Install th
 conda env update -n <your-qiime2-env-name> -f environment.yml
 conda install -n <your-qiime2-env-name> -c conda-forge "setuptools<81"
 conda run -n <your-qiime2-env-name> python -m pip install --force-reinstall --no-deps setuptools==80.9.0
+conda run -n <your-qiime2-env-name> python -m pip install fastq-dl==4.0.1
 conda run -n <your-qiime2-env-name> python -m pip install --no-deps redbiom==0.3.9 q2-greengenes2==2024.1
 ```
+
+`fastq-dl --check` may report `sracha` missing. That only affects SRA downloads; the documented PRJEB44533 command uses `--provider ena`, which needs `wget`.
 
 ### Greengenes2 reference files
 
