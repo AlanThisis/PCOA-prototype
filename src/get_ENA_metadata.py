@@ -37,6 +37,7 @@ XML_BATCH_SIZE = 200
 CORE_COLUMNS = [
     "project_accession",
     "sample_accession",
+    "run_accessions",
     "sample_alias",
     "sample_title",
     "center_name",
@@ -96,6 +97,26 @@ class ENAClient:
             if accession:
                 sample_accessions.append(accession)
         return sample_accessions
+
+    def fetch_run_to_sample(self, project_accession: str) -> dict[str, list[str]]:
+        """Return {sample_accession: [run_accession, ...]} for all runs in the project."""
+        response = self._get(
+            ENA_PORTAL_SEARCH_BASE,
+            {
+                "result": "read_run",
+                "query": f'study_accession="{project_accession}"',
+                "fields": "run_accession,sample_accession",
+                "format": "json",
+                "limit": "0",
+            },
+        )
+        sample_to_runs: dict[str, list[str]] = {}
+        for record in response.json():
+            run = str(record.get("run_accession", "")).strip()
+            sample = str(record.get("sample_accession", "")).strip()
+            if run and sample:
+                sample_to_runs.setdefault(sample, []).append(run)
+        return sample_to_runs
 
     def fetch_samples_xml_batch(self, sample_accessions: list[str]) -> str:
         response = self._get(f"{ENA_BROWSER_XML_BASE}/{','.join(sample_accessions)}")
@@ -188,6 +209,8 @@ def chunked(values: list[str], size: int) -> list[list[str]]:
 def fetch_rows(project_accession: str, max_samples: int | None = None) -> tuple[list[dict[str, str]], list[str]]:
     import sys
     client = ENAClient()
+    print(f"Fetching run accessions for {project_accession}...", file=sys.stderr, flush=True)
+    sample_to_runs = client.fetch_run_to_sample(project_accession)
     print(f"Fetching samples for {project_accession}...", file=sys.stderr, flush=True)
     sample_accessions = unique_preserving_order(client.fetch_sample_accessions(project_accession))
     if not sample_accessions:
@@ -225,7 +248,9 @@ def fetch_rows(project_accession: str, max_samples: int | None = None) -> tuple[
             if sample_el is None:
                 rows.append({"project_accession": project_accession, "sample_accession": acc, "error": "not returned in batch XML"})
             else:
-                rows.append(parse_sample_element(project_accession, sample_el, acc, tag_to_column, column_to_tag))
+                row = parse_sample_element(project_accession, sample_el, acc, tag_to_column, column_to_tag)
+                row["run_accessions"] = "; ".join(sample_to_runs.get(acc, []))
+                rows.append(row)
         fetched += len(sample_elements)
 
     errors = sum(1 for r in rows if r.get("error"))
