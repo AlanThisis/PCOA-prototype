@@ -28,6 +28,8 @@ By default this creates `rachis-qiime2-2026.4`, matching the current QIIME2 Libr
 QIIME2_VERSION=2026.1 QIIME2_ENV_NAME=pcoa-qiime2-gg2 bash scripts/setup_qiime2_gg2_env.sh
 ```
 
+If this fails in GitHub Codespaces with `Terminated` during `Solving environment`, the QIIME2 conda solve was killed before this repo's extras were installed. Retry on a larger Codespace machine if possible. The setup script prefers `micromamba`/`mamba` when available, then falls back to conda's libmamba solver.
+
 Activate before running any pipeline script:
 
 ```bash
