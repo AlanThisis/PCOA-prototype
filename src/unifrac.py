@@ -37,7 +37,6 @@ for env_name, dirname in [
 
 import biom
 import matplotlib.pyplot as plt
-import pandas as pd
 import skbio
 
 from pipeline_lib import resolve_executable, run_command
@@ -82,7 +81,7 @@ def parse_args() -> argparse.Namespace:
         "--threads",
         type=int,
         default=4,
-        help="Threads for vsearch and core-metrics (default: 4).",
+        help="Threads for vsearch and UniFrac beta diversity (default: 4).",
     )
     parser.add_argument(
         "--work-dir",
@@ -96,13 +95,6 @@ def parse_args() -> argparse.Namespace:
 def auto_sampling_depth(biom_fp: Path) -> int:
     table = biom.load_table(str(biom_fp))
     return int(table.sum(axis="sample").min())
-
-
-def write_minimal_metadata(biom_fp: Path, metadata_fp: Path) -> None:
-    table = biom.load_table(str(biom_fp))
-    pd.DataFrame({"sample-id": list(table.ids())}).to_csv(
-        metadata_fp, sep="\t", index=False
-    )
 
 
 def import_artifact(
@@ -145,9 +137,9 @@ def run_qiime2_unifrac(
     work_dir: Path,
     qiime: str,
 ) -> tuple[Path, int]:
-    """Run QIIME2 import → backbone mapping → core-metrics.
+    """Run QIIME2 import → backbone mapping → rarefied UniFrac PCoA.
 
-    Returns (core-metrics output dir, sampling depth used).
+    Returns (work dir containing UniFrac artifacts, sampling depth used).
     """
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -155,16 +147,17 @@ def run_qiime2_unifrac(
     rep_seqs_qza = work_dir / "rep-seqs.qza"
     backbone_table_qza = work_dir / "backbone-mapped-table.qza"
     backbone_reps_qza = work_dir / "backbone-representatives.qza"
-    metadata_tsv = work_dir / "metadata.tsv"
-    core_metrics_dir = work_dir / "core-metrics"
+    rarefied_table_qza = work_dir / "rarefied-backbone-mapped-table.qza"
+    distance_matrix_qza = work_dir / "unweighted_unifrac_distance_matrix.qza"
+    pcoa_qza = work_dir / "unweighted_unifrac_pcoa_results.qza"
 
-    print("Step 1/4: Importing feature table...")
+    print("Step 1/5: Importing feature table...")
     import_artifact(qiime, biom_fp, "FeatureTable[Frequency]", table_qza, input_format="BIOMV210Format")
 
-    print("Step 2/4: Importing representative sequences...")
+    print("Step 2/5: Importing representative sequences...")
     import_artifact(qiime, seqs_fp, "FeatureData[Sequence]", rep_seqs_qza)
 
-    print("Step 3/4: Mapping ASVs to GG2 backbone via closed-reference OTU picking...")
+    print("Step 3/5: Mapping ASVs to GG2 backbone via closed-reference OTU picking...")
     if backbone_table_qza.exists() and backbone_reps_qza.exists():
         print(f"  skipping (exists): {backbone_table_qza.name}")
     else:
@@ -183,22 +176,37 @@ def run_qiime2_unifrac(
         sampling_depth = auto_sampling_depth_from_qza(qiime, backbone_table_qza, work_dir)
     print(f"  Sampling depth: {sampling_depth}")
 
-    write_minimal_metadata(biom_fp, metadata_tsv)
-
-    print(f"Step 4/4: Running core-metrics-phylogenetic (depth={sampling_depth})...")
-    if core_metrics_dir.exists():
-        shutil.rmtree(core_metrics_dir)
+    print(f"Step 4/5: Rarefying mapped table (depth={sampling_depth})...")
+    if rarefied_table_qza.exists():
+        rarefied_table_qza.unlink()
     run_command([
-        qiime, "diversity", "core-metrics-phylogenetic",
-        "--i-phylogeny", str(gg2_tree_fp),
+        qiime, "feature-table", "rarefy",
         "--i-table", str(backbone_table_qza),
         "--p-sampling-depth", str(sampling_depth),
-        "--m-metadata-file", str(metadata_tsv),
-        "--p-n-jobs-or-threads", str(threads),
-        "--output-dir", str(core_metrics_dir),
+        "--o-rarefied-table", str(rarefied_table_qza),
     ])
 
-    return core_metrics_dir, sampling_depth
+    print("Step 5/5: Computing unweighted UniFrac distance matrix and PCoA...")
+    if distance_matrix_qza.exists():
+        distance_matrix_qza.unlink()
+    run_command([
+        qiime, "diversity", "beta-phylogenetic",
+        "--i-phylogeny", str(gg2_tree_fp),
+        "--i-table", str(rarefied_table_qza),
+        "--p-metric", "unweighted_unifrac",
+        "--p-threads", str(threads),
+        "--o-distance-matrix", str(distance_matrix_qza),
+    ])
+
+    if pcoa_qza.exists():
+        pcoa_qza.unlink()
+    run_command([
+        qiime, "diversity", "pcoa",
+        "--i-distance-matrix", str(distance_matrix_qza),
+        "--o-pcoa", str(pcoa_qza),
+    ])
+
+    return work_dir, sampling_depth
 
 
 def auto_sampling_depth_from_qza(qiime: str, table_qza: Path, work_dir: Path) -> int:
@@ -290,7 +298,7 @@ def main() -> int:
 
     configure_writable_caches(work_dir)
 
-    core_metrics_dir, sampling_depth = run_qiime2_unifrac(
+    unifrac_work_dir, sampling_depth = run_qiime2_unifrac(
         biom_fp=biom_fp,
         seqs_fp=seqs_fp,
         gg2_backbone_fp=gg2_backbone_fp,
@@ -305,7 +313,7 @@ def main() -> int:
 
     print("Exporting UniFrac distance matrix...")
     dm_export_dir = work_dir / "unweighted_unifrac_dm_export"
-    export_artifact(qiime, core_metrics_dir / "unweighted_unifrac_distance_matrix.qza", dm_export_dir)
+    export_artifact(qiime, unifrac_work_dir / "unweighted_unifrac_distance_matrix.qza", dm_export_dir)
     shutil.copy(
         dm_export_dir / "distance-matrix.tsv",
         args.results_dir / "distance_matrix_unweighted_unifrac.tsv",
@@ -313,7 +321,7 @@ def main() -> int:
 
     print("Exporting UniFrac PCoA...")
     pcoa_export_dir = work_dir / "unweighted_unifrac_pcoa_export"
-    export_artifact(qiime, core_metrics_dir / "unweighted_unifrac_pcoa_results.qza", pcoa_export_dir)
+    export_artifact(qiime, unifrac_work_dir / "unweighted_unifrac_pcoa_results.qza", pcoa_export_dir)
     ordination_fp = pcoa_export_dir / "ordination.txt"
     shutil.copy(ordination_fp, args.results_dir / "pcoa_coordinates_unweighted_unifrac.txt")
 
