@@ -1,33 +1,19 @@
 # PCOA prototype
 
-A prototype project to process ENA 16S forward reads, denoise with Deblur, and generate beta-diversity + PCoA outputs.
-
-## Tooling
-
-- `fastq-dl` for downloading FASTQ data from ENA
-- `deblur` for QC / denoising
-- `biom-format` Python package for reading BIOM feature tables
-- `scikit-bio` for distance metrics and PCoA analysis
+A prototype project to process ENA 16S forward reads, denoise with Deblur, and generate UniFrac PCoA outputs.
 
 ## Environment setup
 
-The `pcoa-prototype` conda environment covers Deblur, BIOM, scikit-bio, and plotting.
-The UniFrac step additionally requires a [QIIME2 amplicon environment](https://docs.qiime2.org/2024.10/install/) with the [q2-greengenes2 plugin](https://github.com/biocore/q2-greengenes2) installed — any recent QIIME2 amplicon distribution will work.
+### pcoa-prototype
 
-Create the pcoa-prototype environment from the repository root:
+Covers Deblur, BIOM, scikit-bio, seqkit, and plotting. Required for all steps except UniFrac.
 
 ```bash
 conda env create -f environment.yml
 conda activate pcoa-prototype
 ```
 
-If you update the environment, regenerate the file from the installed env with:
-
-```bash
-conda env export -n pcoa-prototype --from-history | sed '/^prefix: /d' > environment.yml
-```
-
-Check that the main tools resolve correctly:
+Check the main tools resolve:
 
 ```bash
 fastq-dl --help
@@ -36,112 +22,97 @@ biom --help
 python -c "import skbio; print(skbio.__version__)"
 ```
 
-The pipeline code also expects Python packages that are now listed in `environment.yml`, including `pandas`, `matplotlib`, and `pytest`.
+### QIIME2 (UniFrac only)
 
-## Forward-only pipeline
+The UniFrac step requires a separate [QIIME2 amplicon environment](https://docs.qiime2.org/2024.10/install/) with the [q2-greengenes2 plugin](https://github.com/biocore/q2-greengenes2) installed. Any recent QIIME2 amplicon distribution works.
 
-Run the pipeline in three steps:
+### Greengenes2 reference files
 
-```bash
-python src/run_deblur.py --data-dir data
-python src/build_table.py
-python src/diversity.py
-```
-
-Use `--work-dir` and `--results-dir` when running multiple experiments side-by-side:
+Download once into `data/gg2/` before running UniFrac (~175 MB total):
 
 ```bash
-python src/run_deblur.py --data-dir data/demux_moving_picture --work-dir work/deblur_moving_picture --trim-length 120
-python src/build_table.py --work-dir work/deblur_moving_picture --results-dir results/moving_picture
-python src/diversity.py --results-dir results/moving_picture --metric braycurtis
+mkdir -p data/gg2
+wget -P data/gg2 https://ftp.microbio.me/greengenes_release/current/2024.09.backbone.full-length.fna.qza
+wget -P data/gg2 https://ftp.microbio.me/greengenes_release/current/2024.09.phylogeny.id.nwk.qza
 ```
 
+If you update the pcoa-prototype environment, regenerate `environment.yml` with:
 
-### Inputs used
-
-The pipeline recursively scans the supplied `--data-dir` and uses forward-read sample FASTQs matching either `*_1.fastq.gz` (ENA-style) or `*_R1_001.fastq.gz` (demux-export style). Reverse reads like `*_2.fastq.gz` are ignored. This works whether the FASTQs are directly under `data/` or nested under a study subdirectory.
-
-It does not do paired-end merging or subsampling.
-
-### What the scripts do
-
-1. `run_deblur.py` recursively discovers forward reads matching `*_1.fastq.gz` or `*_R1_001.fastq.gz` under the input directory.
-2. `run_deblur.py` calls `deblur workflow` directly on that directory.
-3. The primary Deblur artifact is `work/deblur/workflow/all.biom`.
-4. `build_table.py` reads `all.biom` via `biom.load_table` and writes a sample x feature TSV (`results/forward_only/feature_table.tsv`).
-5. `build_table.py` normalizes demux-style sample IDs by removing lane/run suffixes (for example `L5S222_17_L001_R1_001` to `L5S222`).
-6. `diversity.py` computes beta diversity (default: `braycurtis`) and runs PCoA from the feature table.
-7. `diversity.py` writes tabular outputs and a PNG plot.
-
-### Outputs
-
-- Working outputs: `work/deblur/`
-  - `workflow/` Deblur outputs including `all.biom`, `all.seqs.fa`, and workflow metadata/logs
-- Final outputs: `results/forward_only/`
-  - `feature_table.tsv`
-  - `distance_matrix_braycurtis.tsv`
-  - `pcoa_coordinates.tsv`
-  - `pcoa_plot.png`
-
-### File usage quick guide
-
-- `work/.../workflow/all.biom`
-  - Primary Deblur output (feature table in BIOM format).
-  - Use this when you want to re-export tables or compare Deblur runs.
-- `results/.../feature_table.tsv`
-  - Sample x feature matrix used by `diversity.py`.
-  - This is the direct input for scikit-bio beta-diversity/PCoA in this repo.
-- `results/.../distance_matrix_braycurtis.tsv`
-  - Pairwise sample dissimilarity matrix used to derive PCoA coordinates.
-- `results/.../pcoa_coordinates.tsv`
-  - Coordinates for each sample (PC1, PC2, ...); use this for custom plotting or metadata joins.
-- `results/.../pcoa_plot.png`
-  - Static quick-look visualization of the ordination.
-
-Metadata note:
-
-- Feature tables do not contain disease/group labels.
-- Join `pcoa_coordinates.tsv` or `feature_table.tsv` to a metadata TSV by sample ID.
-
-## Notes
-
-This is the first-pass reproducible implementation and is intentionally minimal so future work can branch into paired-end workflows, subsampling comparisons, richer metadata integration, and alternative distance metrics.
-
-Deblur defaults used by `run_deblur.py` are standardized as:
-
-- `--trim-length 150`
-- `--min-reads 0` to disable the final cross-sample abundance filter and keep per-sample denoising independent
-
-## PRJEB44533 Subsampling
-
-Use `src/subsample_fastq.py` to subsample forward reads (`*_1.fastq.gz` or `*_R1_001.fastq.gz`) with `seqkit sample2` in two-pass mode.
-
-Expected PRJEB44533 layout:
-
-```text
-data/fastq_data/PRJEB44533/
-  PRJEB44533-run-info.tsv
-  full/
-  subsample_50/
-  subsample_25/
+```bash
+conda env export -n pcoa-prototype --from-history | sed '/^prefix: /d' > environment.yml
 ```
 
-Example commands:
+---
+
+## End-to-end example: PRJEB44533
+
+PRJEB44533 is a 16S gut microbiome study (204 samples). This example runs the full pipeline from download to UniFrac PCoA at 10% read subsampling.
+
+### 1. Download
+
+```bash
+fastq-dl --accession PRJEB44533 --provider ena --outdir data/fastq_data/PRJEB44533/full
+```
+
+### 2. Subsample
 
 ```bash
 python src/subsample_fastq.py \
   --input-dir data/fastq_data/PRJEB44533/full \
-  --output-dir data/fastq_data/PRJEB44533/subsample_50 \
-  --percent 50 \
-  --seed 11
-
-python src/subsample_fastq.py \
-  --input-dir data/fastq_data/PRJEB44533/full \
-  --output-dir data/fastq_data/PRJEB44533/subsample_25 \
-  --percent 25 \
+  --output-dir data/fastq_data/PRJEB44533/subsample_10 \
+  --percent 10 \
   --seed 11
 ```
 
-Implementation detail:
+`subsample_fastq.py` uses `seqkit sample2` with two-pass mode (`-2`) for stable fraction sampling. Run it again with `--percent 25` / `--percent 50` for additional subsampling levels.
 
-- `subsample_fastq.py` always calls `seqkit sample2` with `-2` (`--two-pass`) for stable fraction sampling on large FASTQ files.
+### 3. Deblur
+
+```bash
+python src/run_deblur.py \
+  --data-dir data/fastq_data/PRJEB44533/subsample_10 \
+  --work-dir work/PRJEB44533_sub10
+```
+
+Outputs land in `work/PRJEB44533_sub10/workflow/`, including `all.biom` and `all.seqs.fa`.
+
+Deblur defaults: `--trim-length 150`, `--min-reads 0` (per-sample denoising, no cross-sample filter).
+
+### 4. UniFrac PCoA
+
+Activate the QIIME2 amplicon environment, then:
+
+```bash
+python src/unifrac.py \
+  --deblur-dir work/PRJEB44533_sub10/workflow \
+  --results-dir results/PRJEB44533_sub10
+```
+
+Outputs written to `results/PRJEB44533_sub10/`:
+- `unweighted_unifrac_distance_matrix.tsv`
+- `unweighted_unifrac_pcoa_results.tsv`
+- `pcoa_plot.png`
+
+`unifrac.py` uses GG2's `non-v4-16s` closed-reference action (vsearch at 99%) to map Deblur ASVs onto the GG2 backbone, then computes UniFrac against the GG2 ID phylogeny. Rarefaction depth defaults to the minimum sample depth after backbone mapping; override with `--sampling-depth`.
+
+---
+
+## Scripts
+
+| Script | Env | Description |
+|--------|-----|-------------|
+| `src/subsample_fastq.py` | pcoa-prototype | Subsample FASTQs to a given percent with seqkit |
+| `src/run_deblur.py` | pcoa-prototype | Run Deblur on a directory of forward FASTQs |
+| `src/build_table.py` | pcoa-prototype | Export Deblur BIOM to TSV feature table |
+| `src/diversity.py` | pcoa-prototype | Bray-Curtis beta diversity + PCoA from feature table |
+| `src/merge_biom.py` | pcoa-prototype | Merge BIOM tables across studies |
+| `src/unifrac.py` | QIIME2 amplicon | UniFrac PCoA via GG2 and QIIME2 |
+| `src/get_ENA_metadata.py` | pcoa-prototype | Fetch sample metadata CSV for an ENA project |
+
+### Inputs
+
+Scripts recursively scan for forward reads matching `*_1.fastq.gz` (ENA-style) or `*_R1_001.fastq.gz` (demux-export style). Reverse reads are ignored.
+
+### Metadata
+
+Feature tables do not contain disease/group labels. Join `pcoa_coordinates.tsv` or `feature_table.tsv` to a metadata TSV by sample ID.
