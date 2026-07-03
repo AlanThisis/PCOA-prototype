@@ -1,12 +1,9 @@
-name: pcoa-prototype
+channels:
+  - bioconda
+  - conda-forge
 dependencies:
   - fastq-dl
-  - deblur
-  - biom-format
-  - matplotlib
-  - pandas
-  - pytest
-  - requests
-  - python=3.11
-  - scikit-bio
-  - seqkit
+  - joblib
+  - msgpack-python
+  - nltk
+  - pip

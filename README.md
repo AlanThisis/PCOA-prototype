@@ -4,13 +4,34 @@ A prototype project to process ENA 16S forward reads, denoise with Deblur, and g
 
 ## Environment setup
 
-### pcoa-prototype
+This pipeline runs inside a single [QIIME2 Rachis environment](https://library.qiime2.org/quickstart/qiime2). QIIME2 supplies Deblur, BIOM, scikit-bio, seqkit, matplotlib, pandas, requests, vsearch, and UniFrac support. This repo adds two missing pieces: `fastq-dl` for ENA downloads and `q2-greengenes2` for Greengenes2-backed UniFrac.
 
-Covers Deblur, BIOM, scikit-bio, seqkit, and plotting. Required for all steps except UniFrac.
+The environment is assembled in three layers:
+
+1. Official QIIME2 Rachis conda environment. Treat this as the base because QIIME2 pins a large stack of Python, compiled, R, and plugin dependencies.
+2. Repo extras from `environment.yml`. This adds non-QIIME tools and helper dependencies, including `fastq-dl`, `joblib`, `msgpack-python`, and `nltk`.
+3. Greengenes2 plugin via `pip --no-deps`. `q2-greengenes2` and `redbiom` are installed without dependency resolution so pip does not replace QIIME2's conda-managed packages such as `scikit-bio`.
+
+This is intentionally not a fully hand-written conda YAML for every package. A custom all-in-one YAML is more fragile because QIIME2's distribution packages need to stay internally consistent.
+
+### One-shot setup
+
+Run from the repo root:
 
 ```bash
-conda env create -f environment.yml
-conda activate pcoa-prototype
+bash scripts/setup_qiime2_gg2_env.sh
+```
+
+By default this creates `rachis-qiime2-2026.4`, matching the current QIIME2 Library quickstart. Override the version or env name if needed:
+
+```bash
+QIIME2_VERSION=2026.1 QIIME2_ENV_NAME=pcoa-qiime2-gg2 bash scripts/setup_qiime2_gg2_env.sh
+```
+
+Activate before running any pipeline script:
+
+```bash
+conda activate rachis-qiime2-2026.4
 ```
 
 Check the main tools resolve:
@@ -18,13 +39,18 @@ Check the main tools resolve:
 ```bash
 fastq-dl --help
 deblur --help
-biom --help
+qiime info
 python -c "import skbio; print(skbio.__version__)"
 ```
 
-### QIIME2 (UniFrac only)
+### Existing QIIME2 env
 
-The UniFrac step requires a separate [QIIME2 amplicon environment](https://docs.qiime2.org/2024.10/install/) with the [q2-greengenes2 plugin](https://github.com/biocore/q2-greengenes2) installed. Any recent QIIME2 amplicon distribution works.
+If QIIME2 is already installed, update that env with the repo extras. Install the GG2 plugin with `--no-deps` so pip does not replace QIIME2's conda-managed packages.
+
+```bash
+conda env update -n <your-qiime2-env-name> -f environment.yml
+conda run -n <your-qiime2-env-name> python -m pip install --no-deps redbiom==0.3.9 q2-greengenes2==2024.1
+```
 
 ### Greengenes2 reference files
 
@@ -36,17 +62,28 @@ wget -P data/gg2 https://ftp.microbio.me/greengenes_release/current/2024.09.back
 wget -P data/gg2 https://ftp.microbio.me/greengenes_release/current/2024.09.phylogeny.id.nwk.qza
 ```
 
-If you update the pcoa-prototype environment, regenerate `environment.yml` with:
-
-```bash
-conda env export -n pcoa-prototype --from-history | sed '/^prefix: /d' > environment.yml
-```
-
 ---
 
-## End-to-end example: PRJEB44533
+## Server runbook: PRJEB44533
 
-PRJEB44533 is a 16S gut microbiome study (204 samples). This example runs the full pipeline from download to UniFrac PCoA at 10% read subsampling.
+PRJEB44533 is a 16S gut microbiome study (204 samples). This example runs the pipeline from raw ENA FASTQs to a Greengenes2-backed unweighted UniFrac PCoA plot using the 10% subsample.
+
+Start from a fresh server clone:
+
+```bash
+git clone <repo-url>
+cd PCOA-prototype
+bash scripts/setup_qiime2_gg2_env.sh
+conda activate rachis-qiime2-2026.4
+```
+
+Download the Greengenes2 artifacts once:
+
+```bash
+mkdir -p data/gg2
+wget -P data/gg2 https://ftp.microbio.me/greengenes_release/current/2024.09.backbone.full-length.fna.qza
+wget -P data/gg2 https://ftp.microbio.me/greengenes_release/current/2024.09.phylogeny.id.nwk.qza
+```
 
 ### 1. Download
 
@@ -71,29 +108,33 @@ python src/subsample_fastq.py \
 ```bash
 python src/run_deblur.py \
   --data-dir data/fastq_data/PRJEB44533/subsample_10 \
-  --work-dir work/PRJEB44533_sub10
+  --work-dir work/PRJEB44533_sub10 \
+  --trim-length 120 \
+  --min-reads 0 \
+  --jobs-to-start 10
 ```
 
 Outputs land in `work/PRJEB44533_sub10/workflow/`, including `all.biom` and `all.seqs.fa`.
 
-Deblur defaults: `--trim-length 150`, `--min-reads 0` (per-sample denoising, no cross-sample filter).
+Use `--trim-length 120` for PRJEB44533 because the reads are about 122 bp. `--min-reads 0` disables Deblur's cross-sample feature-count filter, so samples are treated independently. Adjust `--jobs-to-start` to match available server cores.
 
 ### 4. UniFrac PCoA
-
-Activate the QIIME2 amplicon environment, then:
 
 ```bash
 python src/unifrac.py \
   --deblur-dir work/PRJEB44533_sub10/workflow \
-  --results-dir results/PRJEB44533_sub10
+  --results-dir results/PRJEB44533_sub10 \
+  --threads 10
 ```
 
 Outputs written to `results/PRJEB44533_sub10/`:
-- `unweighted_unifrac_distance_matrix.tsv`
-- `unweighted_unifrac_pcoa_results.tsv`
-- `pcoa_plot.png`
+- `distance_matrix_unweighted_unifrac.tsv`
+- `pcoa_coordinates_unweighted_unifrac.txt`
+- `pcoa_plot_unweighted_unifrac.png`
 
 `unifrac.py` uses GG2's `non-v4-16s` closed-reference action (vsearch at 99%) to map Deblur ASVs onto the GG2 backbone, then computes UniFrac against the GG2 ID phylogeny. Rarefaction depth defaults to the minimum sample depth after backbone mapping; override with `--sampling-depth`.
+
+For a smaller local test, use `--jobs-to-start 4` and `--threads 4`.
 
 ---
 
@@ -101,13 +142,13 @@ Outputs written to `results/PRJEB44533_sub10/`:
 
 | Script | Env | Description |
 |--------|-----|-------------|
-| `src/subsample_fastq.py` | pcoa-prototype | Subsample FASTQs to a given percent with seqkit |
-| `src/run_deblur.py` | pcoa-prototype | Run Deblur on a directory of forward FASTQs |
-| `src/build_table.py` | pcoa-prototype | Export Deblur BIOM to TSV feature table |
-| `src/diversity.py` | pcoa-prototype | Bray-Curtis beta diversity + PCoA from feature table |
-| `src/merge_biom.py` | pcoa-prototype | Merge BIOM tables across studies |
-| `src/unifrac.py` | QIIME2 amplicon | UniFrac PCoA via GG2 and QIIME2 |
-| `src/get_ENA_metadata.py` | pcoa-prototype | Fetch sample metadata CSV for an ENA project |
+| `src/subsample_fastq.py` | QIIME2 + repo extras | Subsample FASTQs to a given percent with seqkit |
+| `src/run_deblur.py` | QIIME2 + repo extras | Run Deblur on a directory of forward FASTQs |
+| `src/build_table.py` | QIIME2 + repo extras | Export Deblur BIOM to TSV feature table |
+| `src/diversity.py` | QIIME2 + repo extras | Bray-Curtis beta diversity + PCoA from feature table |
+| `src/merge_biom.py` | QIIME2 + repo extras | Merge BIOM tables across studies |
+| `src/unifrac.py` | QIIME2 + repo extras | UniFrac PCoA via GG2 and QIIME2 |
+| `src/get_ENA_metadata.py` | QIIME2 + repo extras | Fetch sample metadata CSV for an ENA project |
 
 ### Inputs
 

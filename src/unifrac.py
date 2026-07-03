@@ -22,7 +22,18 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import tempfile
 from pathlib import Path
+
+DEFAULT_CACHE_DIR = Path(tempfile.gettempdir()) / "pcoa-prototype-cache"
+for env_name, dirname in [
+    ("MPLCONFIGDIR", "matplotlib"),
+    ("NUMBA_CACHE_DIR", "numba"),
+    ("XDG_CACHE_HOME", "xdg"),
+]:
+    env_path = DEFAULT_CACHE_DIR / dirname
+    env_path.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault(env_name, str(env_path))
 
 import biom
 import matplotlib.pyplot as plt
@@ -196,6 +207,20 @@ def auto_sampling_depth_from_qza(qiime: str, table_qza: Path, work_dir: Path) ->
     return auto_sampling_depth(export_dir / "feature-table.biom")
 
 
+def configure_writable_caches(work_dir: Path) -> None:
+    cache_dir = work_dir / "_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    for env_name, dirname in [
+        ("NUMBA_CACHE_DIR", "numba"),
+        ("MPLCONFIGDIR", "matplotlib"),
+        ("XDG_CACHE_HOME", "xdg"),
+    ]:
+        env_path = cache_dir / dirname
+        env_path.mkdir(parents=True, exist_ok=True)
+        os.environ[env_name] = str(env_path)
+
+
 def plot_pcoa(ordination_fp: Path, plot_fp: Path, title: str) -> None:
     ord_res = skbio.io.read(
         str(ordination_fp),
@@ -262,6 +287,8 @@ def main() -> int:
         work_dir = args.work_dir.resolve()
     else:
         work_dir = (args.results_dir.parent / f"{args.results_dir.name}_unifrac_work").resolve()
+
+    configure_writable_caches(work_dir)
 
     core_metrics_dir, sampling_depth = run_qiime2_unifrac(
         biom_fp=biom_fp,
