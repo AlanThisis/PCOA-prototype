@@ -50,6 +50,7 @@ If QIIME2 is already installed, update that env with the repo extras. Install th
 ```bash
 conda env update -n <your-qiime2-env-name> -f environment.yml
 conda install -n <your-qiime2-env-name> -c conda-forge "setuptools<81"
+conda run -n <your-qiime2-env-name> python -m pip install --force-reinstall --no-deps setuptools==80.9.0
 conda run -n <your-qiime2-env-name> python -m pip install --no-deps redbiom==0.3.9 q2-greengenes2==2024.1
 ```
 
