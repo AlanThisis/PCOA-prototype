@@ -28,6 +28,7 @@ case "$(uname -s)" in
 esac
 
 conda env update --name "${ENV_NAME}" --file environment.yml
+conda run --name "${ENV_NAME}" python -c "import pkg_resources; print('pkg_resources OK')"
 conda run --name "${ENV_NAME}" python -m pip install --no-deps redbiom==0.3.9 q2-greengenes2==2024.1
 
 conda run --name "${ENV_NAME}" qiime info
@@ -35,7 +36,6 @@ conda run --name "${ENV_NAME}" qiime greengenes2 --help >/dev/null
 conda run --name "${ENV_NAME}" fastq-dl --version
 conda run --name "${ENV_NAME}" seqkit version
 conda run --name "${ENV_NAME}" deblur --version
-conda run --name "${ENV_NAME}" python -c "import pkg_resources; print('pkg_resources OK')"
 conda run --name "${ENV_NAME}" python -c "import biom, skbio, pandas, matplotlib, requests; print('Python deps OK')"
 
 cat <<EOF
