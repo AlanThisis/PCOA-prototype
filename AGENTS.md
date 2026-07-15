@@ -9,6 +9,24 @@ As the project grows, keep code in clearly named top-level directories:
 - `data/` for small sample inputs only; do not commit large raw datasets
 - `results/` or `plots/` for generated outputs that are safe to version
 
+## Slides & Presentation Artifacts
+
+Store presentation work under `slides/`; do not create a separate top-level
+`outputs/` directory. Give each presentation a descriptive, dated directory,
+for example `slides/crc-subsampling-20260710/`, so files from unrelated updates
+do not get mixed together.
+
+Within each presentation directory:
+- keep final `.pptx` and `.pdf` deliverables at the directory root
+- keep generated figures and reusable visual assets under `assets/`
+- keep slide source files under `source/` when source is separate from the final deck
+- keep render previews, inspection reports, and other disposable generation artifacts under `.build/`
+
+Generate artifacts directly into this structure rather than generating them at
+the repository root and moving them afterward. The entire `slides/` directory
+is ignored by Git and should remain local unless the user explicitly requests
+that a presentation deliverable be versioned.
+
 ## Build, Test, and Development Commands
 There is no formal build system in the repository yet. Prefer simple, reproducible CLI workflows and document new commands in [README.md](/workspaces/PCOA-prototype/README.md) when you add them.
 
