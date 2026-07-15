@@ -88,10 +88,3 @@ manifest-compatible resume of the same run.
 Metadata must include either a `sample-id` column or a `run_accessions` column.
 The latter may contain semicolon-separated ENA run accessions. Samples not
 found in metadata are plotted as `Unknown`.
-
-## Legacy Component Outputs
-
-`src/build_table.py` and `src/diversity.py` remain available for the earlier
-Bray-Curtis prototype. Their standalone `results/<name>/feature_table.tsv`,
-`distance_matrix_braycurtis.tsv`, and `pcoa_coordinates.tsv` outputs are not
-part of the canonical GG2/UniFrac run layout.

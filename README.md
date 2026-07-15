@@ -114,7 +114,8 @@ python src/subsample_fastq.py \
   --input-dir data/fastq_data/PRJEB44533/full \
   --output-dir data/fastq_data/PRJEB44533/subsample_10 \
   --percent 10 \
-  --seed 11
+  --seed 11 \
+  --timings-tsv data/fastq_data/PRJEB44533/subsample_10_timings.tsv
 ```
 
 `subsample_fastq.py` uses `seqkit sample2` with two-pass mode (`-2`) for stable fraction sampling. Run it again with `--percent 25` / `--percent 50` for additional subsampling levels.
@@ -254,8 +255,6 @@ Adjust the partition, environment name, memory, and wall time for the server.
 | `src/run_pipeline.py` | QIIME2 + repo extras | Canonical prepared-FASTQ pipeline orchestrator |
 | `src/subsample_fastq.py` | QIIME2 + repo extras | Subsample FASTQs to a given percent with seqkit |
 | `src/run_deblur.py` | QIIME2 + repo extras | Run Deblur on a directory of forward FASTQs |
-| `src/build_table.py` | QIIME2 + repo extras | Export Deblur BIOM to TSV feature table |
-| `src/diversity.py` | QIIME2 + repo extras | Bray-Curtis beta diversity + PCoA from feature table |
 | `src/merge_biom.py` | QIIME2 + repo extras | Merge BIOM tables across studies |
 | `src/unifrac.py` | QIIME2 + repo extras | UniFrac PCoA via GG2 and QIIME2 |
 | `src/plot_pcoa.py` | QIIME2 + repo extras | Plot PCoA coordinates colored by metadata |
@@ -320,4 +319,6 @@ Scripts recursively scan for forward reads matching `*_1.fastq.gz` (ENA-style) o
 
 ### Metadata
 
-Feature tables do not contain disease/group labels. Join `pcoa_coordinates.tsv` or `feature_table.tsv` to a metadata TSV by sample ID.
+Metadata labels are not stored in the feature table. `plot_pcoa.py` joins the
+UniFrac PCoA sample IDs to either the metadata `sample-id` or `run_accessions`
+column.

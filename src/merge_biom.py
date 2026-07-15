@@ -13,7 +13,6 @@ from pathlib import Path
 
 import biom
 import biom.util
-import numpy as np
 
 from pipeline_lib import TimingRecorder, add_timing_argument, run_timed_main
 
