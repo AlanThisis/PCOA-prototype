@@ -20,5 +20,6 @@ results/
 plots/
 tmp/
 work/
+runs/
 deblur.log
 slides/

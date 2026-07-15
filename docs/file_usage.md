@@ -1,61 +1,97 @@
 # File Usage Reference
 
-This document explains how to use key pipeline files and artifacts.
+This document describes the prepared inputs and self-contained output layout
+used by `src/run_pipeline.py`.
 
-## Input files
+## Prepared FASTQ Inputs
 
-- `data/.../*.fastq.gz`
-  - Supported forward-read patterns:
-    - `*_1.fastq.gz` (ENA-style)
-    - `*_R1_001.fastq.gz` (demux-export style)
-  - Reverse reads are ignored by this pipeline.
+- Forward reads may match `*_1.fastq.gz` (ENA style) or
+  `*_R1_001.fastq.gz` (demultiplexed export style).
+- Input discovery is recursive. Reverse reads are ignored.
+- Every file must be non-empty, and sample identifiers must be unique across
+  every `--study NAME=FASTQ_DIR` supplied to one run.
+- Downloading and subsampling happen before orchestration. They intentionally
+  remain separate so server jobs can reuse the same prepared FASTQs.
 
-## Deblur outputs (`run_deblur.py`)
+## Canonical Run Layout
 
-- `work/<run_name>/workflow/all.biom`
-  - Deblur feature table in BIOM format.
-  - Main handoff artifact to `build_table.py`.
-- `work/<run_name>/workflow/all.seqs.fa`
-  - Representative feature sequences from Deblur.
+Every invocation requires a unique `--run-dir`. `runs/` is ignored by Git, but
+the run directory may also point to server scratch or project storage outside
+the clone.
 
-## Table outputs (`build_table.py`)
+```text
+<run-dir>/
+├── run_manifest.json
+├── run_state.json
+├── timings/
+│   ├── attempt-001/
+│   │   ├── pipeline.tsv
+│   │   ├── deblur-<study>.tsv
+│   │   ├── merge.tsv                  # cross-study only
+│   │   ├── unifrac.tsv
+│   │   └── plot-<metadata-column>.tsv
+│   └── attempt-002/                   # created by --resume
+├── work/
+│   ├── deblur/<study>/workflow/
+│   ├── merged/                        # cross-study only
+│   └── qiime2/
+└── results/
+    ├── distance_matrix_unweighted_unifrac.tsv
+    ├── pcoa_coordinates_unweighted_unifrac.txt
+    ├── pcoa_plot_unweighted_unifrac.png
+    └── pcoa_<metadata-column>.png
+```
 
-- `results/<run_name>/feature_table.tsv`
-  - Sample x feature matrix exported from `all.biom` via Python `biom.load_table`.
-  - Demux sample IDs are normalized by removing lane/run suffixes:
-    - `L5S222_17_L001_R1_001` -> `L5S222`
+## Provenance and Resume Files
 
-## Diversity / ordination outputs (`diversity.py`)
+- `run_manifest.json` records resolved FASTQ inputs, scientific parameters,
+  metadata and GG2 paths, input sizes and modification times, Git commit,
+  executable paths, Conda environment, hostname, SLURM job ID, and creation
+  time.
+- `run_state.json` records each stage as `pending`, `running`, `completed`, or
+  `failed`, plus every execution attempt and its thread count.
+- `--resume` is explicit. It requires a matching manifest and skips completed
+  stages only when all expected outputs remain non-empty.
+- Thread count may change between attempts. It is recorded per attempt rather
+  than treated as a scientific compatibility parameter.
+- If Deblur or merge reruns, input-derived QIIME2 imports and GG2 mapping are
+  invalidated before UniFrac resumes. A failed UniFrac stage can still reuse
+  its partial QIIME2 work when no upstream stage changed.
 
-- `results/<run_name>/distance_matrix_braycurtis.tsv`
-  - Sample x sample Bray-Curtis distance matrix.
-- `results/<run_name>/pcoa_coordinates.tsv`
-  - Ordination coordinates for each sample (PC axes).
-- `results/<run_name>/pcoa_plot.png`
-  - Quick static plot of PC1 vs PC2.
+## Deblur Handoff Artifacts
 
-## Comparing to QIIME moving picture artifacts
+- `work/deblur/<study>/workflow/all.biom` is the per-study feature table.
+- `work/deblur/<study>/workflow/all.seqs.fa` contains representative feature
+  sequences.
+- Cross-study runs merge these into `work/merged/all.biom` and
+  `work/merged/all.seqs.fa` before GG2 mapping.
+- Deblur internals are not retained by default. Use
+  `--keep-deblur-tmp-files` only for diagnosis because these files can consume
+  several gigabytes.
 
-- Compare this pipeline's `feature_table.tsv` to:
-  - `data/moving_picture/table.qza` (post-Deblur table)
-- Do not compare directly to:
-  - `data/moving_picture/diversity-core-metrics-phylogenetic/rarefied_table.qza`
-    when expecting unrarefied parity, because that table is depth-normalized and has fewer samples.
+## QIIME2 Work Artifacts
 
-## Metadata usage
+`work/qiime2/` contains imported tables and sequences, GG2 backbone-mapped
+artifacts, the rarefied table, UniFrac distance artifact, PCoA artifact, and
+exports. These are retained to diagnose a failure and may be reused only by a
+manifest-compatible resume of the same run.
 
-- Biological labels (body site, month, subject, intervention) come from metadata, not from feature tables.
-- Use sample ID as join key:
-  - moving picture metadata file: `data/moving_picture/sample-metadata.tsv`
+## Final Results
 
-## PRJEB44533 organization and subsampling
+- `distance_matrix_unweighted_unifrac.tsv` is the sample-by-sample unweighted
+  UniFrac distance matrix.
+- `pcoa_coordinates_unweighted_unifrac.txt` is the QIIME2 PCoA ordination
+  export and is the input to metadata plotting.
+- `pcoa_plot_unweighted_unifrac.png` is an unlabeled quick-look plot.
+- `pcoa_<metadata-column>.png` is generated for each repeated `--color-by`.
 
-- Study layout:
-  - `data/fastq_data/PRJEB44533/full/`: original FASTQ files
-  - `data/fastq_data/PRJEB44533/subsample_50/`: forward-read 50% subset
-  - `data/fastq_data/PRJEB44533/subsample_25/`: forward-read 25% subset
-  - `data/fastq_data/PRJEB44533/PRJEB44533-run-info.tsv`: unchanged study metadata
-- `src/subsample_fastq.py`:
-  - Discovers forward FASTQs recursively (`*_1.fastq.gz`, `*_R1_001.fastq.gz`)
-  - Runs `seqkit sample2` with fixed seed and `-2` (`--two-pass`)
-  - Writes subsampled outputs with the same FASTQ basenames
+Metadata must include either a `sample-id` column or a `run_accessions` column.
+The latter may contain semicolon-separated ENA run accessions. Samples not
+found in metadata are plotted as `Unknown`.
+
+## Legacy Component Outputs
+
+`src/build_table.py` and `src/diversity.py` remain available for the earlier
+Bray-Curtis prototype. Their standalone `results/<name>/feature_table.tsv`,
+`distance_matrix_braycurtis.tsv`, and `pcoa_coordinates.tsv` outputs are not
+part of the canonical GG2/UniFrac run layout.

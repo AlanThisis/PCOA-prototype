@@ -119,53 +119,131 @@ python src/subsample_fastq.py \
 
 `subsample_fastq.py` uses `seqkit sample2` with two-pass mode (`-2`) for stable fraction sampling. Run it again with `--percent 25` / `--percent 50` for additional subsampling levels.
 
-### 4. Deblur
+### 4. Run the Prepared FASTQs
+
+`run_pipeline.py` is the canonical entry point once the forward-read FASTQs are
+downloaded and, if desired, subsampled. It runs Deblur, GG2-backed unweighted
+UniFrac, PCoA, and requested metadata-colored plots in one self-contained run
+directory.
 
 ```bash
-python src/run_deblur.py \
-  --data-dir data/fastq_data/PRJEB44533/subsample_10 \
-  --work-dir work/PRJEB44533_sub10 \
+python src/run_pipeline.py \
+  --study PRJEB44533=data/fastq_data/PRJEB44533/subsample_10 \
+  --metadata data/PRJEB44533/metadata.csv \
+  --color-by description \
+  --run-dir runs/prjeb44533/sub10-001 \
   --trim-length 120 \
   --min-reads 0 \
-  --jobs-to-start 10
-```
-
-Outputs land in `work/PRJEB44533_sub10/workflow/`, including `all.biom` and `all.seqs.fa`.
-
-Use `--trim-length 120` for PRJEB44533 because the reads are about 122 bp. `--min-reads 0` disables Deblur's cross-sample feature-count filter, so samples are treated independently. Adjust `--jobs-to-start` to match available server cores.
-
-### 5. UniFrac PCoA
-
-```bash
-python src/unifrac.py \
-  --deblur-dir work/PRJEB44533_sub10/workflow \
-  --results-dir results/PRJEB44533_sub10 \
   --threads 10
 ```
 
-Outputs written to `results/PRJEB44533_sub10/`:
-- `distance_matrix_unweighted_unifrac.tsv`
-- `pcoa_coordinates_unweighted_unifrac.txt`
-- `pcoa_plot_unweighted_unifrac.png`
+Use a unique `--run-dir` for every server job, normally including the SLURM job
+ID. The directory contains immutable provenance, resume state, per-attempt
+timings, retained handoff artifacts, and final results:
+
+```text
+runs/prjeb44533/sub10-001/
+├── run_manifest.json
+├── run_state.json
+├── timings/attempt-001/
+├── work/
+│   ├── deblur/PRJEB44533/workflow/
+│   └── qiime2/
+└── results/
+    ├── distance_matrix_unweighted_unifrac.tsv
+    ├── pcoa_coordinates_unweighted_unifrac.txt
+    ├── pcoa_plot_unweighted_unifrac.png
+    └── pcoa_description.png
+```
+
+Use `--trim-length 120` for PRJEB44533 because the reads are about 122 bp.
+`--min-reads 0` disables Deblur's cross-sample feature-count filter. Deblur's
+bulky internal temporary files are discarded after successful processing by
+default; add `--keep-deblur-tmp-files` only when diagnosing Deblur.
+
+### Cross-study Runs
+
+Repeat `--study NAME=FASTQ_DIR` to process multiple studies. Each study is
+Deblurred separately, then their `all.biom` and `all.seqs.fa` artifacts are
+merged before one shared GG2/UniFrac analysis:
+
+```bash
+python src/run_pipeline.py \
+  --study ERP005534=data/fastq_data/CRC_cross_study/ERP005534/sub10 \
+  --study PRJEB46665=data/fastq_data/CRC_cross_study/PRJEB46665/sub10 \
+  --metadata data/fastq_data/CRC_cross_study/crc_cross_study_metadata.tsv \
+  --color-by disease_status \
+  --color-by study \
+  --run-dir runs/crc-cross-study/sub10-450671 \
+  --trim-length 120 \
+  --min-reads 0 \
+  --threads 16
+```
+
+Study names and sample identifiers must be unique. For a single study, the
+merge stage is skipped and that study's Deblur workflow is passed directly to
+UniFrac.
 
 `unifrac.py` uses GG2's `non-v4-16s` closed-reference action (vsearch at 99%) to map Deblur ASVs onto the GG2 backbone, then computes UniFrac against the GG2 ID phylogeny. Rarefaction depth defaults to the minimum sample depth after backbone mapping; override with `--sampling-depth`.
 
-For a smaller local test, use `--jobs-to-start 4` and `--threads 4`.
+### Resume a Failed Run
 
-### 6. Plot PCoA With Metadata Labels
-
-After UniFrac finishes, use `plot_pcoa.py` to color the ordination by the PRJEB44533 metadata `description` column:
+Existing runs are never resumed implicitly. Rerun the same command with
+`--resume`; inputs, metadata, GG2 path, Git commit, and scientific parameters
+must match the saved manifest. FASTQs, metadata, and GG2 artifacts are compared
+using their resolved path, size, and modification time. `--threads` may differ
+between attempts.
 
 ```bash
-python src/plot_pcoa.py \
-  --pcoa results/PRJEB44533_sub10/pcoa_coordinates_unweighted_unifrac.txt \
+python src/run_pipeline.py \
+  --study PRJEB44533=data/fastq_data/PRJEB44533/subsample_10 \
   --metadata data/PRJEB44533/metadata.csv \
   --color-by description \
-  --out results/PRJEB44533_sub10/pcoa_description.png \
-  --title "PRJEB44533 - description"
+  --run-dir runs/prjeb44533/sub10-001 \
+  --trim-length 120 \
+  --min-reads 0 \
+  --threads 4 \
+  --resume
 ```
 
-`plot_pcoa.py` matches PCoA sample IDs to the metadata CSV through the `run_accessions` column written by `get_ENA_metadata.py`. Samples not found in metadata are labeled `Unknown`.
+Completed stages are skipped only when all expected outputs remain non-empty.
+If a stage must rerun, every downstream stage reruns as well. Each invocation
+gets a new `timings/attempt-NNN/` directory, so failed-attempt timing records
+are preserved. When Deblur or merge reruns, the orchestrator refreshes QIIME2's
+imported table, representative sequences, and GG2 mapping instead of reusing
+stale upstream artifacts.
+
+### Generic SLURM Wrapper
+
+SLURM should only allocate resources, activate the environment, choose a unique
+run path, and invoke the Python orchestrator. Keep project-specific job scripts
+local rather than adding one script per dataset to the repository.
+
+```bash
+#!/usr/bin/env bash
+#SBATCH --partition=short
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+#SBATCH --time=1-00:00:00
+#SBATCH --job-name=pcoa
+#SBATCH --output=slurm-%x-%j.out
+
+set -euo pipefail
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate qiime2-amplicon-2024.10
+cd /path/to/PCOA-prototype
+
+python src/run_pipeline.py \
+  --study PRJEB44533=data/fastq_data/PRJEB44533/subsample_10 \
+  --metadata data/PRJEB44533/metadata.csv \
+  --color-by description \
+  --run-dir "runs/prjeb44533/sub10-${SLURM_JOB_ID}" \
+  --trim-length 120 \
+  --min-reads 0 \
+  --threads "${SLURM_CPUS_PER_TASK}"
+```
+
+Adjust the partition, environment name, memory, and wall time for the server.
 
 ---
 
@@ -173,18 +251,25 @@ python src/plot_pcoa.py \
 
 | Script | Env | Description |
 |--------|-----|-------------|
+| `src/run_pipeline.py` | QIIME2 + repo extras | Canonical prepared-FASTQ pipeline orchestrator |
 | `src/subsample_fastq.py` | QIIME2 + repo extras | Subsample FASTQs to a given percent with seqkit |
 | `src/run_deblur.py` | QIIME2 + repo extras | Run Deblur on a directory of forward FASTQs |
 | `src/build_table.py` | QIIME2 + repo extras | Export Deblur BIOM to TSV feature table |
 | `src/diversity.py` | QIIME2 + repo extras | Bray-Curtis beta diversity + PCoA from feature table |
 | `src/merge_biom.py` | QIIME2 + repo extras | Merge BIOM tables across studies |
 | `src/unifrac.py` | QIIME2 + repo extras | UniFrac PCoA via GG2 and QIIME2 |
+| `src/plot_pcoa.py` | QIIME2 + repo extras | Plot PCoA coordinates colored by metadata |
 | `src/get_ENA_metadata.py` | QIIME2 + repo extras | Fetch sample metadata CSV for an ENA project |
 
-### Optional Runtime Profiling
+### Runtime Profiling
 
-Every Python CLI accepts an optional `--timings-tsv` path. No timing file is
-written unless the option is supplied.
+The orchestrator always writes an attempt-level `pipeline.tsv` plus detailed
+component timing TSVs under `<run-dir>/timings/attempt-NNN/`. These separate
+Deblur, merge, Greengenes2 mapping, rarefaction, UniFrac, PCoA, exports, and
+metadata plotting rather than labeling the entire QIIME stage as UniFrac.
+
+When running a component CLI directly for debugging, enable the same detailed
+timing format with its optional `--timings-tsv` argument:
 
 ```bash
 python src/unifrac.py \
@@ -213,21 +298,21 @@ For `unifrac.py`, the detailed operations distinguish:
 - `diversity pcoa`
 - artifact exports and local plotting
 
-The CRC SLURM scripts retain their high-level pipeline `timings.tsv`. Enable the
-additional Python operation files with:
+For a complete benchmark, use a fresh run directory. A validated resume can
+reuse QIIME2 imports and GG2 mapping artifacts, so its component timings do not
+represent a clean full-pipeline runtime.
+
+### Component CLIs for Debugging
+
+The orchestrator invokes component scripts using the active Python executable.
+They remain available for inspecting or rerunning individual boundaries:
 
 ```bash
-PROFILE_TIMINGS=1 sbatch scripts/slurm_crc_sub10_unifrac.sh
-PROFILE_TIMINGS=1 sbatch scripts/slurm_crc_sub25_sub50_unifrac.sh
+python src/run_deblur.py --help
+python src/merge_biom.py --help
+python src/unifrac.py --help
+python src/plot_pcoa.py --help
 ```
-
-Detailed files are written under each result directory's `timings_detailed/`
-subdirectory. The high-level SLURM duration remains the authoritative total
-wall time because it also includes Python imports, QIIME2 startup, and small
-orchestration gaps between named operations. For a complete benchmark, use a
-fresh work directory. QIIME2 imports and GG2 mapping are intentionally reused
-when their intermediate artifacts already exist, and a cached rerun therefore
-does not represent a full pipeline runtime.
 
 ### Inputs
 

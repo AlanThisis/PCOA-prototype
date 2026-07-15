@@ -66,6 +66,7 @@ def test_parse_args_parses_jobs_to_start(monkeypatch: pytest.MonkeyPatch) -> Non
     assert args.jobs_to_start == 4
     assert args.trim_length == 200
     assert args.min_reads == 0
+    assert args.keep_tmp_files is False
 
 
 def test_run_deblur_workflow_builds_expected_command(
@@ -114,12 +115,40 @@ def test_run_deblur_workflow_builds_expected_command(
                 "0",
                 "--jobs-to-start",
                 "3",
-                "--keep-tmp-files",
                 "--overwrite",
             ],
             None,
         )
     ]
+
+
+def test_run_deblur_workflow_keeps_tmp_files_only_when_requested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seqs_dir = tmp_path / "inputs"
+    seqs_dir.mkdir()
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    commands: list[list[str]] = []
+
+    def fake_run_command(args: list[str], **_: object) -> None:
+        (work_dir / "workflow").mkdir()
+        commands.append(args)
+
+    monkeypatch.setattr(run_deblur, "run_command", fake_run_command)
+
+    run_deblur_workflow(
+        seqs_dir,
+        work_dir,
+        250,
+        "1,0.06,0.02",
+        0,
+        3,
+        "/env/bin/deblur",
+        keep_tmp_files=True,
+    )
+
+    assert "--keep-tmp-files" in commands[0]
 
 
 def test_stage_inputs_for_deblur_stages_only_discovered_fastqs(tmp_path: Path) -> None:

@@ -95,6 +95,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Directory for intermediate QIIME2 artifacts (default: <results-dir>/../<name>_unifrac_work).",
     )
+    parser.add_argument(
+        "--refresh-input-artifacts",
+        action="store_true",
+        help=(
+            "Re-import the feature table and representative sequences and rerun "
+            "GG2 mapping. Used when upstream Deblur or merge outputs were regenerated."
+        ),
+    )
     add_timing_argument(parser)
     return parser.parse_args()
 
@@ -348,6 +356,17 @@ def configure_writable_caches(work_dir: Path) -> None:
         os.environ[env_name] = str(env_path)
 
 
+def clear_input_artifact_cache(work_dir: Path) -> None:
+    for filename in (
+        "table.qza",
+        "rep-seqs.qza",
+        "backbone-mapped-table.qza",
+        "backbone-representatives.qza",
+    ):
+        (work_dir / filename).unlink(missing_ok=True)
+    shutil.rmtree(work_dir / "_depth_check_export", ignore_errors=True)
+
+
 def plot_pcoa(ordination_fp: Path, plot_fp: Path, title: str) -> None:
     ord_res = skbio.io.read(
         str(ordination_fp),
@@ -415,6 +434,8 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
         work_dir = (args.results_dir.parent / f"{args.results_dir.name}_unifrac_work").resolve()
 
     configure_writable_caches(work_dir)
+    if args.refresh_input_artifacts:
+        clear_input_artifact_cache(work_dir)
 
     unifrac_work_dir, sampling_depth = run_qiime2_unifrac(
         biom_fp=biom_fp,

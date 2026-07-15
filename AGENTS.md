@@ -3,11 +3,32 @@
 ## Project Structure & Module Organization
 This repository is currently a lightweight prototype. The top level contains [README.md](/workspaces/PCOA-prototype/README.md), which describes the goal: subsample ENA read data and generate PCoA plots quickly using `seqkit`, `deblur`, and `scikit-bio`.
 
-As the project grows, keep code in clearly named top-level directories:
+Keep code and generated artifacts in clearly named top-level directories:
 - `src/` for pipeline or analysis code
 - `tests/` for automated checks
 - `data/` for small sample inputs only; do not commit large raw datasets
-- `results/` or `plots/` for generated outputs that are safe to version
+- `runs/` for self-contained local pipeline runs; this directory is ignored
+- `results/` for selected summary artifacts that are intentionally retained
+
+`src/run_pipeline.py` is the canonical entry point for prepared FASTQ
+directories. New pipeline work should preserve its run layout:
+
+```text
+<run-dir>/
+├── run_manifest.json
+├── run_state.json
+├── timings/attempt-NNN/
+├── work/deblur/<study>/workflow/
+├── work/merged/                 # cross-study only
+├── work/qiime2/
+└── results/
+```
+
+Development is server-first: make and test code changes in the repository,
+then commit and push them before executing data-heavy runs on the lab server.
+SLURM files are thin, project-specific resource wrappers and should remain
+local unless the user explicitly requests one be versioned. Downloads and
+subsampling remain separate preparation steps rather than orchestrator stages.
 
 ## Slides & Presentation Artifacts
 

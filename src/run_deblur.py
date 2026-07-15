@@ -37,6 +37,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--jobs-to-start", type=int, default=1)
+    parser.add_argument(
+        "--keep-tmp-files",
+        action="store_true",
+        help="Retain Deblur workflow internals for debugging (large; disabled by default).",
+    )
     add_timing_argument(parser)
     return parser.parse_args()
 
@@ -50,28 +55,31 @@ def run_deblur_workflow(
     jobs_to_start: int,
     deblur_executable_path: str,
     timing: TimingRecorder | None = None,
+    keep_tmp_files: bool = False,
 ) -> Path:
     timing = timing or TimingRecorder(None, component="run_deblur")
     workflow_output_dir = work_dir / "workflow"
+    command = [
+        deblur_executable_path,
+        "workflow",
+        "--seqs-fp",
+        str(seqs_dir),
+        "--output-dir",
+        str(workflow_output_dir),
+        "--trim-length",
+        str(trim_length),
+        "--error-dist",
+        error_dist,
+        "--min-reads",
+        str(min_reads),
+        "--jobs-to-start",
+        str(jobs_to_start),
+    ]
+    if keep_tmp_files:
+        command.append("--keep-tmp-files")
+    command.append("--overwrite")
     run_command(
-        [
-            deblur_executable_path,
-            "workflow",
-            "--seqs-fp",
-            str(seqs_dir),
-            "--output-dir",
-            str(workflow_output_dir),
-            "--trim-length",
-            str(trim_length),
-            "--error-dist",
-            error_dist,
-            "--min-reads",
-            str(min_reads),
-            "--jobs-to-start",
-            str(jobs_to_start),
-            "--keep-tmp-files",
-            "--overwrite",
-        ],
+        command,
         timing=timing,
         step="deblur_workflow",
         item=str(workflow_output_dir),
@@ -132,6 +140,7 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
             args.jobs_to_start,
             deblur_executable_path,
             timing,
+            args.keep_tmp_files,
         )
     print(f"Finished. Deblur outputs written under: {workflow_output_dir}")
     return 0

@@ -85,3 +85,31 @@ def test_qiime_workflow_records_cached_mapping_as_skipped(
     assert statuses["import_representative_sequences"] == "skipped"
     assert statuses["gg2_non_v4_16s_mapping"] == "skipped"
     assert statuses["determine_sampling_depth"] == "skipped"
+
+
+def test_clear_input_artifact_cache_removes_only_input_derived_files(
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    for filename in (
+        "table.qza",
+        "rep-seqs.qza",
+        "backbone-mapped-table.qza",
+        "backbone-representatives.qza",
+    ):
+        (work_dir / filename).write_text("cached")
+    depth_export = work_dir / "_depth_check_export"
+    depth_export.mkdir()
+    (depth_export / "feature-table.biom").write_text("cached")
+    retained = work_dir / "unweighted_unifrac_distance_matrix.qza"
+    retained.write_text("retained")
+
+    unifrac.clear_input_artifact_cache(work_dir)
+
+    assert not (work_dir / "table.qza").exists()
+    assert not (work_dir / "rep-seqs.qza").exists()
+    assert not (work_dir / "backbone-mapped-table.qza").exists()
+    assert not (work_dir / "backbone-representatives.qza").exists()
+    assert not depth_export.exists()
+    assert retained.is_file()
