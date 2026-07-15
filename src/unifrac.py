@@ -39,7 +39,13 @@ import biom
 import matplotlib.pyplot as plt
 import skbio
 
-from pipeline_lib import resolve_executable, run_command
+from pipeline_lib import (
+    TimingRecorder,
+    add_timing_argument,
+    resolve_executable,
+    run_command,
+    run_timed_main,
+)
 
 
 GG2_BACKBONE_FILENAME = "2024.09.backbone.full-length.fna.qza"
@@ -89,6 +95,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Directory for intermediate QIIME2 artifacts (default: <results-dir>/../<name>_unifrac_work).",
     )
+    add_timing_argument(parser)
     return parser.parse_args()
 
 
@@ -103,9 +110,13 @@ def import_artifact(
     artifact_type: str,
     output_qza: Path,
     input_format: str | None = None,
+    timing: TimingRecorder | None = None,
+    step: str = "import_artifact",
 ) -> None:
     if output_qza.exists():
         print(f"  skipping (exists): {output_qza.name}")
+        if timing is not None:
+            timing.skipped(step, item=str(output_qza), message="artifact exists")
         return
     cmd = [
         qiime, "tools", "import",
@@ -115,16 +126,37 @@ def import_artifact(
     ]
     if input_format:
         cmd += ["--input-format", input_format]
-    run_command(cmd)
+    run_command(
+        cmd,
+        timing=timing,
+        step=step,
+        item=str(output_qza),
+    )
 
 
-def export_artifact(qiime: str, artifact_fp: Path, export_dir: Path) -> None:
+def export_artifact(
+    qiime: str,
+    artifact_fp: Path,
+    export_dir: Path,
+    *,
+    timing: TimingRecorder | None = None,
+    step: str = "export_artifact",
+) -> None:
     export_dir.mkdir(parents=True, exist_ok=True)
-    run_command([
-        qiime, "tools", "export",
-        "--input-path", str(artifact_fp),
-        "--output-path", str(export_dir),
-    ])
+    run_command(
+        [
+            qiime,
+            "tools",
+            "export",
+            "--input-path",
+            str(artifact_fp),
+            "--output-path",
+            str(export_dir),
+        ],
+        timing=timing,
+        step=step,
+        item=str(artifact_fp),
+    )
 
 
 def run_qiime2_unifrac(
@@ -136,6 +168,7 @@ def run_qiime2_unifrac(
     threads: int,
     work_dir: Path,
     qiime: str,
+    timing: TimingRecorder,
 ) -> tuple[Path, int]:
     """Run QIIME2 import → backbone mapping → rarefied UniFrac PCoA.
 
@@ -152,67 +185,153 @@ def run_qiime2_unifrac(
     pcoa_qza = work_dir / "unweighted_unifrac_pcoa_results.qza"
 
     print("Step 1/5: Importing feature table...")
-    import_artifact(qiime, biom_fp, "FeatureTable[Frequency]", table_qza, input_format="BIOMV210Format")
+    import_artifact(
+        qiime,
+        biom_fp,
+        "FeatureTable[Frequency]",
+        table_qza,
+        input_format="BIOMV210Format",
+        timing=timing,
+        step="import_feature_table",
+    )
 
     print("Step 2/5: Importing representative sequences...")
-    import_artifact(qiime, seqs_fp, "FeatureData[Sequence]", rep_seqs_qza)
+    import_artifact(
+        qiime,
+        seqs_fp,
+        "FeatureData[Sequence]",
+        rep_seqs_qza,
+        timing=timing,
+        step="import_representative_sequences",
+    )
 
     print("Step 3/5: Mapping ASVs to GG2 backbone via closed-reference OTU picking...")
     if backbone_table_qza.exists() and backbone_reps_qza.exists():
         print(f"  skipping (exists): {backbone_table_qza.name}")
+        timing.skipped(
+            "gg2_non_v4_16s_mapping",
+            item=str(backbone_table_qza),
+            message="mapped table and representatives exist",
+        )
     else:
-        run_command([
-            qiime, "greengenes2", "non-v4-16s",
-            "--i-table", str(table_qza),
-            "--i-sequences", str(rep_seqs_qza),
-            "--i-backbone", str(gg2_backbone_fp),
-            "--p-threads", str(threads),
-            "--o-mapped-table", str(backbone_table_qza),
-            "--o-representatives", str(backbone_reps_qza),
-        ])
+        run_command(
+            [
+                qiime,
+                "greengenes2",
+                "non-v4-16s",
+                "--i-table",
+                str(table_qza),
+                "--i-sequences",
+                str(rep_seqs_qza),
+                "--i-backbone",
+                str(gg2_backbone_fp),
+                "--p-threads",
+                str(threads),
+                "--o-mapped-table",
+                str(backbone_table_qza),
+                "--o-representatives",
+                str(backbone_reps_qza),
+            ],
+            timing=timing,
+            step="gg2_non_v4_16s_mapping",
+            item=str(backbone_table_qza),
+        )
 
     # Determine sampling depth from backbone-mapped table (may differ from raw table)
     if sampling_depth is None:
-        sampling_depth = auto_sampling_depth_from_qza(qiime, backbone_table_qza, work_dir)
+        sampling_depth = auto_sampling_depth_from_qza(
+            qiime, backbone_table_qza, work_dir, timing
+        )
+    else:
+        timing.skipped(
+            "determine_sampling_depth",
+            item=str(sampling_depth),
+            message="sampling depth supplied by --sampling-depth",
+        )
     print(f"  Sampling depth: {sampling_depth}")
 
     print(f"Step 4/5: Rarefying mapped table (depth={sampling_depth})...")
     if rarefied_table_qza.exists():
         rarefied_table_qza.unlink()
-    run_command([
-        qiime, "feature-table", "rarefy",
-        "--i-table", str(backbone_table_qza),
-        "--p-sampling-depth", str(sampling_depth),
-        "--o-rarefied-table", str(rarefied_table_qza),
-    ])
+    run_command(
+        [
+            qiime,
+            "feature-table",
+            "rarefy",
+            "--i-table",
+            str(backbone_table_qza),
+            "--p-sampling-depth",
+            str(sampling_depth),
+            "--o-rarefied-table",
+            str(rarefied_table_qza),
+        ],
+        timing=timing,
+        step="rarefy_feature_table",
+        item=f"depth={sampling_depth}",
+    )
 
     print("Step 5/5: Computing unweighted UniFrac distance matrix and PCoA...")
     if distance_matrix_qza.exists():
         distance_matrix_qza.unlink()
-    run_command([
-        qiime, "diversity", "beta-phylogenetic",
-        "--i-phylogeny", str(gg2_tree_fp),
-        "--i-table", str(rarefied_table_qza),
-        "--p-metric", "unweighted_unifrac",
-        "--p-threads", str(threads),
-        "--o-distance-matrix", str(distance_matrix_qza),
-    ])
+    run_command(
+        [
+            qiime,
+            "diversity",
+            "beta-phylogenetic",
+            "--i-phylogeny",
+            str(gg2_tree_fp),
+            "--i-table",
+            str(rarefied_table_qza),
+            "--p-metric",
+            "unweighted_unifrac",
+            "--p-threads",
+            str(threads),
+            "--o-distance-matrix",
+            str(distance_matrix_qza),
+        ],
+        timing=timing,
+        step="unweighted_unifrac",
+        item=str(distance_matrix_qza),
+    )
 
     if pcoa_qza.exists():
         pcoa_qza.unlink()
-    run_command([
-        qiime, "diversity", "pcoa",
-        "--i-distance-matrix", str(distance_matrix_qza),
-        "--o-pcoa", str(pcoa_qza),
-    ])
+    run_command(
+        [
+            qiime,
+            "diversity",
+            "pcoa",
+            "--i-distance-matrix",
+            str(distance_matrix_qza),
+            "--o-pcoa",
+            str(pcoa_qza),
+        ],
+        timing=timing,
+        step="pcoa",
+        item=str(pcoa_qza),
+    )
 
     return work_dir, sampling_depth
 
 
-def auto_sampling_depth_from_qza(qiime: str, table_qza: Path, work_dir: Path) -> int:
+def auto_sampling_depth_from_qza(
+    qiime: str,
+    table_qza: Path,
+    work_dir: Path,
+    timing: TimingRecorder,
+) -> int:
     export_dir = work_dir / "_depth_check_export"
-    export_artifact(qiime, table_qza, export_dir)
-    return auto_sampling_depth(export_dir / "feature-table.biom")
+    export_artifact(
+        qiime,
+        table_qza,
+        export_dir,
+        timing=timing,
+        step="export_mapped_table_for_depth",
+    )
+    with timing.step(
+        "calculate_sampling_depth", item=str(export_dir / "feature-table.biom")
+    ):
+        return auto_sampling_depth(export_dir / "feature-table.biom")
 
 
 def configure_writable_caches(work_dir: Path) -> None:
@@ -250,8 +369,7 @@ def plot_pcoa(ordination_fp: Path, plot_fp: Path, title: str) -> None:
     plt.close(fig)
 
 
-def main() -> int:
-    args = parse_args()
+def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
     args.deblur_dir = args.deblur_dir.resolve()
     args.results_dir = args.results_dir.resolve()
     args.gg2_dir = args.gg2_dir.resolve()
@@ -307,33 +425,58 @@ def main() -> int:
         threads=args.threads,
         work_dir=work_dir,
         qiime=qiime,
+        timing=timing,
     )
 
     args.results_dir.mkdir(parents=True, exist_ok=True)
 
     print("Exporting UniFrac distance matrix...")
     dm_export_dir = work_dir / "unweighted_unifrac_dm_export"
-    export_artifact(qiime, unifrac_work_dir / "unweighted_unifrac_distance_matrix.qza", dm_export_dir)
-    shutil.copy(
-        dm_export_dir / "distance-matrix.tsv",
-        args.results_dir / "distance_matrix_unweighted_unifrac.tsv",
+    export_artifact(
+        qiime,
+        unifrac_work_dir / "unweighted_unifrac_distance_matrix.qza",
+        dm_export_dir,
+        timing=timing,
+        step="export_distance_matrix",
     )
+    with timing.step("copy_distance_matrix"):
+        shutil.copy(
+            dm_export_dir / "distance-matrix.tsv",
+            args.results_dir / "distance_matrix_unweighted_unifrac.tsv",
+        )
 
     print("Exporting UniFrac PCoA...")
     pcoa_export_dir = work_dir / "unweighted_unifrac_pcoa_export"
-    export_artifact(qiime, unifrac_work_dir / "unweighted_unifrac_pcoa_results.qza", pcoa_export_dir)
+    export_artifact(
+        qiime,
+        unifrac_work_dir / "unweighted_unifrac_pcoa_results.qza",
+        pcoa_export_dir,
+        timing=timing,
+        step="export_pcoa",
+    )
     ordination_fp = pcoa_export_dir / "ordination.txt"
-    shutil.copy(ordination_fp, args.results_dir / "pcoa_coordinates_unweighted_unifrac.txt")
+    with timing.step("copy_pcoa_coordinates"):
+        shutil.copy(
+            ordination_fp,
+            args.results_dir / "pcoa_coordinates_unweighted_unifrac.txt",
+        )
 
     print("Generating PCoA plot...")
-    plot_pcoa(
-        ordination_fp=ordination_fp,
-        plot_fp=args.results_dir / "pcoa_plot_unweighted_unifrac.png",
-        title=f"PCoA — Unweighted UniFrac (Greengenes2 backbone, depth={sampling_depth})",
-    )
+    with timing.step("plot_unlabeled_pcoa"):
+        plot_pcoa(
+            ordination_fp=ordination_fp,
+            plot_fp=args.results_dir / "pcoa_plot_unweighted_unifrac.png",
+            title=f"PCoA — Unweighted UniFrac (Greengenes2 backbone, depth={sampling_depth})",
+        )
 
     print(f"\nFinished. Outputs written under: {args.results_dir}")
     return 0
+
+
+def main() -> int:
+    args = parse_args()
+    timing = TimingRecorder(args.timings_tsv, component="unifrac")
+    return run_timed_main(timing, lambda: run(args, timing))
 
 
 if __name__ == "__main__":

@@ -181,6 +181,54 @@ python src/plot_pcoa.py \
 | `src/unifrac.py` | QIIME2 + repo extras | UniFrac PCoA via GG2 and QIIME2 |
 | `src/get_ENA_metadata.py` | QIIME2 + repo extras | Fetch sample metadata CSV for an ENA project |
 
+### Optional Runtime Profiling
+
+Every Python CLI accepts an optional `--timings-tsv` path. No timing file is
+written unless the option is supplied.
+
+```bash
+python src/unifrac.py \
+  --deblur-dir work/PRJEB44533_sub10/workflow \
+  --results-dir results/PRJEB44533_sub10 \
+  --threads 10 \
+  --timings-tsv results/PRJEB44533_sub10/unifrac_timings.tsv
+```
+
+The common timing schema records the component, operation, optional input item,
+UTC start/end timestamps, elapsed seconds, status, exit code, external command,
+and error or skip reason. Records are written when an operation starts and
+an additional terminal row is appended when it finishes. This append-only event
+log keeps timing I/O linear and leaves an interrupted operation's latest event
+marked `running`. Use `completed`, `failed`, and `skipped` rows for elapsed-time
+analysis; cached operations are marked `skipped` instead of being reported as
+zero-second work.
+
+For `unifrac.py`, the detailed operations distinguish:
+
+- QIIME2 feature-table and representative-sequence imports
+- Greengenes2 `non-v4-16s` backbone mapping
+- mapped-table export and automatic sampling-depth calculation
+- feature-table rarefaction
+- `diversity beta-phylogenetic`, the actual unweighted UniFrac calculation
+- `diversity pcoa`
+- artifact exports and local plotting
+
+The CRC SLURM scripts retain their high-level pipeline `timings.tsv`. Enable the
+additional Python operation files with:
+
+```bash
+PROFILE_TIMINGS=1 sbatch scripts/slurm_crc_sub10_unifrac.sh
+PROFILE_TIMINGS=1 sbatch scripts/slurm_crc_sub25_sub50_unifrac.sh
+```
+
+Detailed files are written under each result directory's `timings_detailed/`
+subdirectory. The high-level SLURM duration remains the authoritative total
+wall time because it also includes Python imports, QIIME2 startup, and small
+orchestration gaps between named operations. For a complete benchmark, use a
+fresh work directory. QIIME2 imports and GG2 mapping are intentionally reused
+when their intermediate artifacts already exist, and a cached rerun therefore
+does not represent a full pipeline runtime.
+
 ### Inputs
 
 Scripts recursively scan for forward reads matching `*_1.fastq.gz` (ENA-style) or `*_R1_001.fastq.gz` (demux-export style). Reverse reads are ignored.

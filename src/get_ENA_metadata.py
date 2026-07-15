@@ -22,6 +22,12 @@ from collections import OrderedDict
 
 import requests
 
+from pipeline_lib import (
+    TimingRecorder,
+    add_timing_argument,
+    run_timed_main,
+)
+
 
 ENA_PORTAL_SEARCH_BASE = "https://www.ebi.ac.uk/ena/portal/api/search"
 ENA_BROWSER_XML_BASE = "https://www.ebi.ac.uk/ena/browser/api/xml"
@@ -206,13 +212,22 @@ def chunked(values: list[str], size: int) -> list[list[str]]:
     return [values[i:i + size] for i in range(0, len(values), size)]
 
 
-def fetch_rows(project_accession: str, max_samples: int | None = None) -> tuple[list[dict[str, str]], list[str]]:
+def fetch_rows(
+    project_accession: str,
+    max_samples: int | None = None,
+    timing: TimingRecorder | None = None,
+) -> tuple[list[dict[str, str]], list[str]]:
     import sys
+    timing = timing or TimingRecorder(None, component="get_ENA_metadata")
     client = ENAClient()
     print(f"Fetching run accessions for {project_accession}...", file=sys.stderr, flush=True)
-    sample_to_runs = client.fetch_run_to_sample(project_accession)
+    with timing.step("fetch_run_accessions", item=project_accession):
+        sample_to_runs = client.fetch_run_to_sample(project_accession)
     print(f"Fetching samples for {project_accession}...", file=sys.stderr, flush=True)
-    sample_accessions = unique_preserving_order(client.fetch_sample_accessions(project_accession))
+    with timing.step("fetch_sample_accessions", item=project_accession):
+        sample_accessions = unique_preserving_order(
+            client.fetch_sample_accessions(project_accession)
+        )
     if not sample_accessions:
         raise RuntimeError(f"No sample accessions found for project {project_accession}")
     if max_samples is not None:
@@ -232,10 +247,15 @@ def fetch_rows(project_accession: str, max_samples: int | None = None) -> tuple[
         end = start + len(batch) - 1
         print(f"  Batch [{batch_i}/{len(batches)}] samples {start}–{end}...", file=sys.stderr, end="", flush=True)
         try:
-            batch_xml = client.fetch_samples_xml_batch(batch)
-            root = ET.fromstring(batch_xml)
-            sample_elements = root.findall("./SAMPLE")
-            by_accession = {el.get("accession", ""): el for el in sample_elements}
+            batch_item = f"batch={batch_i};samples={start}-{end}"
+            with timing.step("fetch_sample_xml_batch", item=batch_item):
+                batch_xml = client.fetch_samples_xml_batch(batch)
+            with timing.step("parse_sample_xml_batch", item=batch_item):
+                root = ET.fromstring(batch_xml)
+                sample_elements = root.findall("./SAMPLE")
+                by_accession = {
+                    el.get("accession", ""): el for el in sample_elements
+                }
             print(f" got {len(sample_elements)}", file=sys.stderr, flush=True)
         except Exception as exc:
             print(f" error: {exc}", file=sys.stderr, flush=True)
@@ -294,12 +314,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Only fetch the first N sample accessions from the project. Useful for quick tests on large studies.",
     )
+    add_timing_argument(parser)
     return parser
 
 
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
+def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
     project_accession = args.project_accession.strip().upper()
 
     if not PROJECT_RE.fullmatch(project_accession):
@@ -310,13 +329,25 @@ def main() -> int:
         return 1
 
     try:
-        rows, columns = fetch_rows(project_accession, max_samples=args.max_samples)
+        rows, columns = fetch_rows(
+            project_accession,
+            max_samples=args.max_samples,
+            timing=timing,
+        )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    write_csv(rows, columns, args.output)
+    with timing.step("write_metadata_csv", item=args.output or "stdout"):
+        write_csv(rows, columns, args.output)
     return 0
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    timing = TimingRecorder(args.timings_tsv, component="get_ENA_metadata")
+    return run_timed_main(timing, lambda: run(args, timing))
 
 
 if __name__ == "__main__":

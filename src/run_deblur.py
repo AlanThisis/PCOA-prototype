@@ -6,7 +6,14 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from pipeline_lib import discover_inputs, resolve_executable, run_command
+from pipeline_lib import (
+    TimingRecorder,
+    add_timing_argument,
+    discover_inputs,
+    resolve_executable,
+    run_command,
+    run_timed_main,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,6 +37,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--jobs-to-start", type=int, default=1)
+    add_timing_argument(parser)
     return parser.parse_args()
 
 
@@ -41,7 +49,9 @@ def run_deblur_workflow(
     min_reads: int,
     jobs_to_start: int,
     deblur_executable_path: str,
+    timing: TimingRecorder | None = None,
 ) -> Path:
+    timing = timing or TimingRecorder(None, component="run_deblur")
     workflow_output_dir = work_dir / "workflow"
     run_command(
         [
@@ -61,7 +71,10 @@ def run_deblur_workflow(
             str(jobs_to_start),
             "--keep-tmp-files",
             "--overwrite",
-        ]
+        ],
+        timing=timing,
+        step="deblur_workflow",
+        item=str(workflow_output_dir),
     )
     if not workflow_output_dir.exists():
         raise FileNotFoundError(f"Deblur workflow output missing: {workflow_output_dir}")
@@ -91,14 +104,14 @@ def stage_inputs_for_deblur(fastq_paths: list[Path], staging_dir: Path) -> Path:
     return staging_dir
 
 
-def main() -> int:
-    args = parse_args()
+def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
     args.data_dir = args.data_dir.resolve()
     args.work_dir = args.work_dir.resolve()
     args.work_dir.mkdir(parents=True, exist_ok=True)
 
     deblur_executable_path = resolve_executable("deblur")
-    fastq_paths = discover_inputs(args.data_dir)
+    with timing.step("discover_forward_fastqs", item=str(args.data_dir)):
+        fastq_paths = discover_inputs(args.data_dir)
     print(
         f"Discovered {len(fastq_paths)} forward-read FASTQs under {args.data_dir}.",
         flush=True,
@@ -108,7 +121,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory(
         prefix="deblur-inputs-", dir=str(args.work_dir)
     ) as tmp_dir:
-        staged_inputs_dir = stage_inputs_for_deblur(fastq_paths, Path(tmp_dir))
+        with timing.step("stage_deblur_inputs", item=f"{len(fastq_paths)} FASTQs"):
+            staged_inputs_dir = stage_inputs_for_deblur(fastq_paths, Path(tmp_dir))
         workflow_output_dir = run_deblur_workflow(
             staged_inputs_dir,
             args.work_dir,
@@ -117,9 +131,16 @@ def main() -> int:
             args.min_reads,
             args.jobs_to_start,
             deblur_executable_path,
+            timing,
         )
     print(f"Finished. Deblur outputs written under: {workflow_output_dir}")
     return 0
+
+
+def main() -> int:
+    args = parse_args()
+    timing = TimingRecorder(args.timings_tsv, component="run_deblur")
+    return run_timed_main(timing, lambda: run(args, timing))
 
 
 if __name__ == "__main__":

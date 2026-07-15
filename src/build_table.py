@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from pipeline_lib import TimingRecorder, add_timing_argument, run_timed_main
+
 
 SAMPLE_SUFFIX_PATTERN = re.compile(r"_[0-9]+_L[0-9]{3}_R[12]_[0-9]{3}$")
 ENA_READ_SUFFIX_PATTERN = re.compile(r"^(?P<accession>[EDS]RR[0-9]+)_[12]$")
@@ -19,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--work-dir", type=Path, default=Path("work/deblur"))
     parser.add_argument("--results-dir", type=Path, default=Path("results/forward_only"))
     parser.add_argument("--biom-fp", type=Path, default=None)
+    add_timing_argument(parser)
     return parser.parse_args()
 
 
@@ -37,19 +40,23 @@ def read_feature_table_from_biom(biom_fp: Path) -> pd.DataFrame:
     return biom_table.to_dataframe(dense=True).T
 
 
-def build_feature_table_from_biom(biom_fp: Path) -> pd.DataFrame:
-    feature_table = read_feature_table_from_biom(biom_fp)
+def build_feature_table_from_biom(
+    biom_fp: Path, timing: TimingRecorder | None = None
+) -> pd.DataFrame:
+    timing = timing or TimingRecorder(None, component="build_table")
+    with timing.step("load_biom_table", item=str(biom_fp)):
+        feature_table = read_feature_table_from_biom(biom_fp)
 
-    feature_table.index = feature_table.index.to_series().map(normalize_sample_id)
-    feature_table = feature_table.groupby(level=0, sort=True).sum()
-    feature_table = feature_table.reindex(sorted(feature_table.columns), axis=1)
-    feature_table.index.name = "sample_id"
-    feature_table.columns.name = "feature_id"
+    with timing.step("normalize_feature_table"):
+        feature_table.index = feature_table.index.to_series().map(normalize_sample_id)
+        feature_table = feature_table.groupby(level=0, sort=True).sum()
+        feature_table = feature_table.reindex(sorted(feature_table.columns), axis=1)
+        feature_table.index.name = "sample_id"
+        feature_table.columns.name = "feature_id"
     return feature_table
 
 
-def main() -> int:
-    args = parse_args()
+def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
     args.work_dir = args.work_dir.resolve()
     args.results_dir = args.results_dir.resolve()
     args.results_dir.mkdir(parents=True, exist_ok=True)
@@ -61,14 +68,21 @@ def main() -> int:
     if not biom_fp.exists():
         raise FileNotFoundError(f"Deblur BIOM file not found: {biom_fp}")
 
-    feature_table = build_feature_table_from_biom(biom_fp)
+    feature_table = build_feature_table_from_biom(biom_fp, timing)
     feature_fp = args.results_dir / "feature_table.tsv"
-    feature_table.to_csv(feature_fp, sep="\t")
+    with timing.step("write_feature_table", item=str(feature_fp)):
+        feature_table.to_csv(feature_fp, sep="\t")
 
     print(f"Feature table shape: {feature_table.shape}")
     print("Samples in feature table:", ", ".join(feature_table.index.tolist()))
     print(f"Finished. Feature table written to: {feature_fp}")
     return 0
+
+
+def main() -> int:
+    args = parse_args()
+    timing = TimingRecorder(args.timings_tsv, component="build_table")
+    return run_timed_main(timing, lambda: run(args, timing))
 
 
 if __name__ == "__main__":

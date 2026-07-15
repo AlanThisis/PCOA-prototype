@@ -78,7 +78,9 @@ def test_run_deblur_workflow_builds_expected_command(
     workflow_output_dir = work_dir / "workflow"
     commands: list[tuple[list[str], Path | None]] = []
 
-    def fake_run_command(args: list[str], cwd: Path | None = None) -> None:
+    def fake_run_command(
+        args: list[str], cwd: Path | None = None, **_: object
+    ) -> None:
         workflow_output_dir.mkdir()
         commands.append((args, cwd))
 

@@ -32,7 +32,9 @@ def test_subsample_fastqs_discovers_forward_reads_only_and_builds_sample2_comman
     output_dir = tmp_path / "out"
     commands: list[list[str]] = []
 
-    def fake_run_command(args: list[str], cwd: Path | None = None) -> None:
+    def fake_run_command(
+        args: list[str], cwd: Path | None = None, **_: object
+    ) -> None:
         del cwd
         commands.append(args)
 
@@ -72,7 +74,9 @@ def test_subsample_fastqs_preserves_relative_paths_to_avoid_name_collisions(
     output_dir = tmp_path / "out"
     commands: list[list[str]] = []
 
-    def fake_run_command(args: list[str], cwd: Path | None = None) -> None:
+    def fake_run_command(
+        args: list[str], cwd: Path | None = None, **_: object
+    ) -> None:
         del cwd
         commands.append(args)
 
@@ -105,7 +109,9 @@ def test_subsample_fastqs_excludes_existing_output_files_under_input_tree(
 
     commands: list[list[str]] = []
 
-    def fake_run_command(args: list[str], cwd: Path | None = None) -> None:
+    def fake_run_command(
+        args: list[str], cwd: Path | None = None, **_: object
+    ) -> None:
         del cwd
         commands.append(args)
 

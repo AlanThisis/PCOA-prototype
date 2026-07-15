@@ -34,6 +34,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import skbio
 
+from pipeline_lib import TimingRecorder, add_timing_argument, run_timed_main
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -52,6 +54,7 @@ def parse_args() -> argparse.Namespace:
                         help="Which PCs to plot (1-based, default: 1 2).")
     parser.add_argument("--title", default=None,
                         help="Plot title. Defaults to the output filename stem.")
+    add_timing_argument(parser)
     return parser.parse_args()
 
 
@@ -95,56 +98,74 @@ def load_id_to_label(metadata_path: Path, color_by: str) -> dict[str, str]:
     return id_to_label
 
 
-def main() -> int:
-    args = parse_args()
+def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
 
-    pcoa = skbio.OrdinationResults.read(str(args.pcoa))
-    px, py = args.pc[0] - 1, args.pc[1] - 1
-    coords = pcoa.samples.iloc[:, [px, py]].copy()
-    coords.columns = ["x", "y"]
+    with timing.step("load_pcoa", item=str(args.pcoa)):
+        pcoa = skbio.OrdinationResults.read(str(args.pcoa))
+        px, py = args.pc[0] - 1, args.pc[1] - 1
+        coords = pcoa.samples.iloc[:, [px, py]].copy()
+        coords.columns = ["x", "y"]
 
-    eigvals = pcoa.eigvals
-    pct = eigvals / eigvals.sum() * 100
+        eigvals = pcoa.eigvals
+        pct = eigvals / eigvals.sum() * 100
 
     try:
-        id_to_label = load_id_to_label(args.metadata, args.color_by)
+        with timing.step("load_metadata", item=str(args.metadata)):
+            id_to_label = load_id_to_label(args.metadata, args.color_by)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
-    labels = [id_to_label.get(strip_read_suffix(sid), "Unknown") for sid in coords.index]
-    unmapped = labels.count("Unknown")
+    with timing.step("match_metadata_labels", item=args.color_by):
+        labels = [
+            id_to_label.get(strip_read_suffix(sid), "Unknown")
+            for sid in coords.index
+        ]
+        unmapped = labels.count("Unknown")
     if unmapped:
         print(f"Warning: {unmapped}/{len(labels)} samples not found in metadata (labeled 'Unknown').",
               file=sys.stderr)
 
-    unique_labels = sorted(set(labels))
-    cmap = plt.get_cmap("tab10" if len(unique_labels) <= 10 else "tab20")
-    color_map = {label: cmap(i) for i, label in enumerate(unique_labels)}
+    with timing.step("render_pcoa_plot", item=str(args.out)):
+        unique_labels = sorted(set(labels))
+        cmap = plt.get_cmap("tab10" if len(unique_labels) <= 10 else "tab20")
+        color_map = {label: cmap(i) for i, label in enumerate(unique_labels)}
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    for label in unique_labels:
-        idx = [i for i, l in enumerate(labels) if l == label]
-        ax.scatter(
-            coords["x"].iloc[idx],
-            coords["y"].iloc[idx],
-            label=f"{label} (n={len(idx)})",
-            color=color_map[label],
-            alpha=0.7,
-            s=40,
-            edgecolors="none",
+        fig, ax = plt.subplots(figsize=(8, 6))
+        for label in unique_labels:
+            idx = [i for i, label_value in enumerate(labels) if label_value == label]
+            ax.scatter(
+                coords["x"].iloc[idx],
+                coords["y"].iloc[idx],
+                label=f"{label} (n={len(idx)})",
+                color=color_map[label],
+                alpha=0.7,
+                s=40,
+                edgecolors="none",
+            )
+
+        ax.set_xlabel(f"PC{args.pc[0]} ({pct.iloc[px]:.1f}%)")
+        ax.set_ylabel(f"PC{args.pc[1]} ({pct.iloc[py]:.1f}%)")
+        ax.set_title(args.title or args.out.stem)
+        ax.legend(
+            title=args.color_by,
+            bbox_to_anchor=(1.02, 1),
+            loc="upper left",
+            fontsize=9,
         )
+        plt.tight_layout()
 
-    ax.set_xlabel(f"PC{args.pc[0]} ({pct.iloc[px]:.1f}%)")
-    ax.set_ylabel(f"PC{args.pc[1]} ({pct.iloc[py]:.1f}%)")
-    ax.set_title(args.title or args.out.stem)
-    ax.legend(title=args.color_by, bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=9)
-    plt.tight_layout()
-
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(args.out, dpi=150)
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(args.out, dpi=150)
+        plt.close(fig)
     print(f"Saved to {args.out}", file=sys.stderr)
     return 0
+
+
+def main() -> int:
+    args = parse_args()
+    timing = TimingRecorder(args.timings_tsv, component="plot_pcoa")
+    return run_timed_main(timing, lambda: run(args, timing))
 
 
 if __name__ == "__main__":

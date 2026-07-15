@@ -15,6 +15,8 @@ import biom
 import biom.util
 import numpy as np
 
+from pipeline_lib import TimingRecorder, add_timing_argument, run_timed_main
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Merge Deblur outputs from multiple studies.")
@@ -22,6 +24,7 @@ def parse_args() -> argparse.Namespace:
                         help="Deblur workflow output dirs (each must have all.biom and all.seqs.fa).")
     parser.add_argument("--out-dir", type=Path, required=True,
                         help="Output directory for merged all.biom and all.seqs.fa.")
+    add_timing_argument(parser)
     return parser.parse_args()
 
 
@@ -40,8 +43,7 @@ def load_seqs(fa_fp: Path) -> dict[str, str]:
     return seqs
 
 
-def main() -> int:
-    args = parse_args()
+def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
     args.out_dir = args.out_dir.resolve()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -56,31 +58,42 @@ def main() -> int:
             raise FileNotFoundError(f"Missing: {biom_fp}")
         if not fa_fp.exists():
             raise FileNotFoundError(f"Missing: {fa_fp}")
-        t = biom.load_table(str(biom_fp))
+        with timing.step("load_deblur_output", item=str(d)):
+            t = biom.load_table(str(biom_fp))
+            loaded_seqs = load_seqs(fa_fp)
         print(f"  {d.name}: {t.shape[1]} samples, {t.shape[0]} features")
         tables.append(t)
-        all_seqs.update(load_seqs(fa_fp))
+        all_seqs.update(loaded_seqs)
 
-    merged = tables[0]
-    for t in tables[1:]:
-        merged = merged.merge(t)
+    with timing.step("merge_feature_tables", item=f"{len(tables)} tables"):
+        merged = tables[0]
+        for t in tables[1:]:
+            merged = merged.merge(t)
 
     print(f"Merged: {merged.shape[1]} samples, {merged.shape[0]} features")
 
     out_biom = args.out_dir / "all.biom"
-    with biom.util.biom_open(str(out_biom), "w") as f:
-        merged.to_hdf5(f, "merge_biom.py")
+    with timing.step("write_merged_biom", item=str(out_biom)):
+        with biom.util.biom_open(str(out_biom), "w") as f:
+            merged.to_hdf5(f, "merge_biom.py")
     print(f"Written: {out_biom}")
 
     out_fa = args.out_dir / "all.seqs.fa"
-    feature_ids = set(merged.ids(axis="observation"))
-    with out_fa.open("w") as f:
-        for seq_id, seq in all_seqs.items():
-            if seq_id in feature_ids:
-                f.write(f">{seq_id}\n{seq}\n")
+    with timing.step("write_representative_sequences", item=str(out_fa)):
+        feature_ids = set(merged.ids(axis="observation"))
+        with out_fa.open("w") as f:
+            for seq_id, seq in all_seqs.items():
+                if seq_id in feature_ids:
+                    f.write(f">{seq_id}\n{seq}\n")
     print(f"Written: {out_fa}")
 
     return 0
+
+
+def main() -> int:
+    args = parse_args()
+    timing = TimingRecorder(args.timings_tsv, component="merge_biom")
+    return run_timed_main(timing, lambda: run(args, timing))
 
 
 if __name__ == "__main__":
