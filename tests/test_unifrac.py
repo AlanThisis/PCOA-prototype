@@ -3,8 +3,37 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
+import pytest
+
 import unifrac
 from pipeline_lib import TimingRecorder
+
+
+def test_auto_sampling_depth_ignores_zero_count_samples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = unifrac.biom.Table(
+        [[0, 5, 12]],
+        observation_ids=["feature-1"],
+        sample_ids=["zero", "minimum-positive", "larger"],
+    )
+    monkeypatch.setattr(unifrac.biom, "load_table", lambda _: table)
+
+    assert unifrac.auto_sampling_depth(Path("mapped.biom")) == 5
+
+
+def test_auto_sampling_depth_rejects_an_all_zero_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = unifrac.biom.Table(
+        [[0, 0]],
+        observation_ids=["feature-1"],
+        sample_ids=["zero-1", "zero-2"],
+    )
+    monkeypatch.setattr(unifrac.biom, "load_table", lambda _: table)
+
+    with pytest.raises(ValueError, match="no samples retained reads"):
+        unifrac.auto_sampling_depth(Path("mapped.biom"))
 
 
 def test_qiime_workflow_uses_distinct_scientific_timing_steps(

@@ -109,7 +109,14 @@ def parse_args() -> argparse.Namespace:
 
 def auto_sampling_depth(biom_fp: Path) -> int:
     table = biom.load_table(str(biom_fp))
-    return int(table.sum(axis="sample").min())
+    sample_depths = table.sum(axis="sample")
+    positive_depths = sample_depths[sample_depths > 0]
+    if positive_depths.size == 0:
+        raise ValueError(
+            "Cannot choose a rarefaction depth: no samples retained reads after "
+            "Greengenes2 backbone mapping."
+        )
+    return int(positive_depths.min())
 
 
 def import_artifact(
