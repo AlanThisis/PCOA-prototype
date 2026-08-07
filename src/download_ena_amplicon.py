@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import shutil
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,7 +15,6 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
-from urllib.request import urlopen
 
 import requests
 
@@ -262,27 +263,53 @@ def verify_download(
     part_path.replace(destination)
 
 
-def transfer_via_ftp(spec: DownloadSpec, destination: Path, timeout: float) -> int:
+def transfer_via_curl(spec: DownloadSpec, destination: Path, timeout: float) -> int:
     part_path = destination.with_name(destination.name + ".part")
-    part_path.unlink(missing_ok=True)
-    downloaded_bytes = 0
-    try:
-        with urlopen(ftp_url(spec.url), timeout=timeout) as response:  # noqa: S310
-            content_length = response.headers.get("Content-Length")
-            if content_length is not None and int(content_length) != spec.bytes:
-                raise RuntimeError(
-                    f"FTP content length mismatch: expected {spec.bytes}, "
-                    f"got {content_length}"
-                )
-            with part_path.open("wb") as handle:
-                while chunk := response.read(8 * 1024 * 1024):
-                    handle.write(chunk)
-                    downloaded_bytes += len(chunk)
-        verify_download(spec, part_path, destination)
-        return downloaded_bytes
-    except Exception:
+    curl = shutil.which("curl")
+    if curl is None:
+        raise RuntimeError("curl is not installed")
+
+    https = https_url(spec.url)
+    urls = [https, https.replace("https://", "http://", 1), ftp_url(https)]
+    errors: list[str] = []
+    for url in urls:
         part_path.unlink(missing_ok=True)
-        raise
+        result = subprocess.run(
+            [
+                curl,
+                "--fail",
+                "--location",
+                "--silent",
+                "--show-error",
+                "--connect-timeout",
+                str(timeout),
+                "--speed-limit",
+                "1",
+                "--speed-time",
+                str(timeout),
+                "--retry",
+                "2",
+                "--retry-delay",
+                "2",
+                "--output",
+                str(part_path),
+                url,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            errors.append(f"{url}: curl exit {result.returncode}: {result.stderr.strip()}")
+            continue
+        try:
+            verify_download(spec, part_path, destination)
+            return spec.bytes
+        except (OSError, RuntimeError) as exc:
+            errors.append(f"{url}: {exc}")
+
+    part_path.unlink(missing_ok=True)
+    raise RuntimeError("; ".join(errors))
 
 
 def transfer_via_https(spec: DownloadSpec, destination: Path, timeout: float) -> int:
@@ -352,11 +379,11 @@ def transfer_once(spec: DownloadSpec, destination: Path, timeout: float) -> int:
         return transfer_via_https(spec, destination, timeout)
     except (requests.HTTPError, RuntimeError) as https_error:
         try:
-            return transfer_via_ftp(spec, destination, timeout)
-        except (OSError, RuntimeError) as ftp_error:
+            return transfer_via_curl(spec, destination, timeout)
+        except (OSError, RuntimeError) as curl_error:
             raise RuntimeError(
-                f"HTTPS failed ({https_error}); FTP failed ({ftp_error})"
-            ) from ftp_error
+                f"Python HTTPS failed ({https_error}); curl fallback failed ({curl_error})"
+            ) from curl_error
 
 
 def download_one(

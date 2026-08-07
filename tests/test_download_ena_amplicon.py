@@ -147,25 +147,6 @@ class FakeDownloadResponse:
         self.close()
 
 
-class FakeFtpResponse:
-    def __init__(self, content: bytes) -> None:
-        self.content = content
-        self.offset = 0
-        self.headers = {"Content-Length": str(len(content))}
-
-    def read(self, _: int) -> bytes:
-        if self.offset:
-            return b""
-        self.offset = len(self.content)
-        return self.content
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        return None
-
-
 def make_spec(content: bytes) -> DownloadSpec:
     return DownloadSpec(
         project_accession="PRJ1",
@@ -235,7 +216,7 @@ def test_transfer_discards_stale_partial_and_restarts_after_html(
     assert "Range" not in request_headers[1]
 
 
-def test_transfer_falls_back_to_ftp_after_clean_https_returns_html(
+def test_transfer_falls_back_to_verified_curl_after_python_https_returns_html(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     content = b"complete-fastq"
@@ -247,20 +228,23 @@ def test_transfer_falls_back_to_ftp_after_clean_https_returns_html(
         "get",
         lambda *_args, **_kwargs: response,
     )
-    ftp_requests: list[str] = []
+    curl_requests: list[str] = []
 
-    def fake_urlopen(url: str, **_: object) -> FakeFtpResponse:
-        ftp_requests.append(url)
-        return FakeFtpResponse(content)
+    def fake_run(command: list[str], **_: object) -> object:
+        curl_requests.append(command[-1])
+        output_path = Path(command[command.index("--output") + 1])
+        output_path.write_bytes(content)
+        return type("Result", (), {"returncode": 0, "stderr": ""})()
 
-    monkeypatch.setattr(download_ena_amplicon, "urlopen", fake_urlopen)
+    monkeypatch.setattr(download_ena_amplicon.shutil, "which", lambda _: "/usr/bin/curl")
+    monkeypatch.setattr(download_ena_amplicon.subprocess, "run", fake_run)
 
     downloaded = transfer_once(spec, destination, timeout=60)
 
     assert downloaded == len(content)
     assert destination.read_bytes() == content
     assert not destination.with_name(destination.name + ".part").exists()
-    assert ftp_requests == ["ftp://ftp.sra.ebi.ac.uk/SRR1_1.fastq.gz"]
+    assert curl_requests == ["https://ftp.sra.ebi.ac.uk/SRR1_1.fastq.gz"]
 
 
 def test_valid_final_file_removes_stale_partial(
