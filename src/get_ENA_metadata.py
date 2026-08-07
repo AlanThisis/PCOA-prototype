@@ -37,7 +37,7 @@ TOOL_NAME = "ena_metadata_harmonization"
 # conservative default for repeated XML fetches.
 DEFAULT_REQUESTS_PER_SECOND = 2.0
 MIN_REQUEST_INTERVAL_SECONDS = 1.0 / DEFAULT_REQUESTS_PER_SECOND
-PROJECT_RE = re.compile(r"^[A-Z]{4,}\d+$", re.IGNORECASE)
+PROJECT_RE = re.compile(r"^[A-Z]{3,}\d+$", re.IGNORECASE)
 XML_BATCH_SIZE = 200
 
 CORE_COLUMNS = [
@@ -86,11 +86,15 @@ class ENAClient:
         return response
 
     def fetch_sample_accessions(self, project_accession: str) -> list[str]:
+        # ENA's sample search does not expose secondary_study_accession. Archive
+        # aliases obtain their samples from the run-to-sample mapping instead.
+        if not project_accession.upper().startswith("PRJ"):
+            return []
         response = self._get(
             ENA_PORTAL_SEARCH_BASE,
             {
                 "result": "sample",
-                "query": f'study_accession="{project_accession}"',
+                "query": study_query(project_accession),
                 "fields": "sample_accession",
                 "format": "json",
                 "limit": "0",
@@ -110,7 +114,7 @@ class ENAClient:
             ENA_PORTAL_SEARCH_BASE,
             {
                 "result": "read_run",
-                "query": f'study_accession="{project_accession}"',
+                "query": study_query(project_accession),
                 "fields": "run_accession,sample_accession",
                 "format": "json",
                 "limit": "0",
@@ -136,6 +140,15 @@ def normalize_column_name(raw_name: str) -> str:
     return normalized or "unnamed_field"
 
 
+def study_query(project_accession: str) -> str:
+    field = (
+        "study_accession"
+        if project_accession.upper().startswith("PRJ")
+        else "secondary_study_accession"
+    )
+    return f'{field}="{project_accession}"'
+
+
 def add_value(row: dict[str, str], column_name: str, value: str) -> None:
     clean_value = " ".join(value.split())
     if not clean_value:
@@ -158,6 +171,15 @@ def unique_preserving_order(values: list[str]) -> list[str]:
         seen.add(value)
         ordered.append(value)
     return ordered
+
+
+def resolve_sample_accessions(
+    portal_accessions: list[str], sample_to_runs: dict[str, list[str]]
+) -> list[str]:
+    """Use run-linked samples when ENA's study-level sample query is empty."""
+    if portal_accessions:
+        return unique_preserving_order(portal_accessions)
+    return list(sample_to_runs)
 
 
 def assign_dynamic_column(
@@ -225,8 +247,8 @@ def fetch_rows(
         sample_to_runs = client.fetch_run_to_sample(project_accession)
     print(f"Fetching samples for {project_accession}...", file=sys.stderr, flush=True)
     with timing.step("fetch_sample_accessions", item=project_accession):
-        sample_accessions = unique_preserving_order(
-            client.fetch_sample_accessions(project_accession)
+        sample_accessions = resolve_sample_accessions(
+            client.fetch_sample_accessions(project_accession), sample_to_runs
         )
     if not sample_accessions:
         raise RuntimeError(f"No sample accessions found for project {project_accession}")
