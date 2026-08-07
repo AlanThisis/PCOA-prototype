@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
+from urllib.request import urlopen
 
 import requests
 
@@ -93,6 +94,11 @@ def https_url(raw_url: str) -> str:
     if "://" not in raw_url:
         return "https://" + raw_url
     return raw_url
+
+
+def ftp_url(raw_url: str) -> str:
+    parsed = urlparse(https_url(raw_url))
+    return parsed._replace(scheme="ftp").geturl()
 
 
 def split_field(record: dict[str, object], name: str) -> list[str]:
@@ -242,7 +248,44 @@ def completed_file_is_valid(path: Path, spec: DownloadSpec) -> bool:
     )
 
 
-def transfer_once(spec: DownloadSpec, destination: Path, timeout: float) -> int:
+def verify_download(
+    spec: DownloadSpec, part_path: Path, destination: Path
+) -> None:
+    if part_path.stat().st_size != spec.bytes:
+        raise RuntimeError(
+            f"size mismatch: expected {spec.bytes}, got {part_path.stat().st_size}"
+        )
+    actual_md5 = file_md5(part_path)
+    if actual_md5 != spec.md5:
+        part_path.unlink(missing_ok=True)
+        raise RuntimeError(f"MD5 mismatch: expected {spec.md5}, got {actual_md5}")
+    part_path.replace(destination)
+
+
+def transfer_via_ftp(spec: DownloadSpec, destination: Path, timeout: float) -> int:
+    part_path = destination.with_name(destination.name + ".part")
+    part_path.unlink(missing_ok=True)
+    downloaded_bytes = 0
+    try:
+        with urlopen(ftp_url(spec.url), timeout=timeout) as response:  # noqa: S310
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None and int(content_length) != spec.bytes:
+                raise RuntimeError(
+                    f"FTP content length mismatch: expected {spec.bytes}, "
+                    f"got {content_length}"
+                )
+            with part_path.open("wb") as handle:
+                while chunk := response.read(8 * 1024 * 1024):
+                    handle.write(chunk)
+                    downloaded_bytes += len(chunk)
+        verify_download(spec, part_path, destination)
+        return downloaded_bytes
+    except Exception:
+        part_path.unlink(missing_ok=True)
+        raise
+
+
+def transfer_via_https(spec: DownloadSpec, destination: Path, timeout: float) -> int:
     part_path = destination.with_name(destination.name + ".part")
     download_url = spec.url.strip().rstrip("/")
     existing_bytes = part_path.stat().st_size if part_path.exists() else 0
@@ -260,7 +303,9 @@ def transfer_once(spec: DownloadSpec, destination: Path, timeout: float) -> int:
         timeout=(timeout, timeout),
         allow_redirects=False,
     )
-    if response.status_code == 416 and existing_bytes > 0:
+    content_type = response.headers.get("Content-Type", "").lower()
+    rejected_resume = response.status_code == 416 or "text/html" in content_type
+    if rejected_resume and existing_bytes > 0:
         response.close()
         part_path.unlink()
         existing_bytes = 0
@@ -278,12 +323,14 @@ def transfer_once(spec: DownloadSpec, destination: Path, timeout: float) -> int:
         resume_accepted = existing_bytes > 0 and response.status_code == 206
         content_type = response.headers.get("Content-Type", "").lower()
         if "text/html" in content_type:
+            part_path.unlink(missing_ok=True)
             raise RuntimeError(
                 f"ENA returned HTML instead of FASTQ for {spec.run_accession}"
             )
         content_length = response.headers.get("Content-Length")
         expected_response_bytes = spec.bytes - existing_bytes if resume_accepted else spec.bytes
         if content_length is not None and int(content_length) != expected_response_bytes:
+            part_path.unlink(missing_ok=True)
             raise RuntimeError(
                 f"HTTP content length mismatch: expected {expected_response_bytes}, "
                 f"got {content_length}"
@@ -296,15 +343,20 @@ def transfer_once(spec: DownloadSpec, destination: Path, timeout: float) -> int:
                     handle.write(chunk)
                     downloaded_bytes += len(chunk)
 
-    if part_path.stat().st_size != spec.bytes:
-        raise RuntimeError(
-            f"size mismatch: expected {spec.bytes}, got {part_path.stat().st_size}"
-        )
-    actual_md5 = file_md5(part_path)
-    if actual_md5 != spec.md5:
-        raise RuntimeError(f"MD5 mismatch: expected {spec.md5}, got {actual_md5}")
-    part_path.replace(destination)
+    verify_download(spec, part_path, destination)
     return downloaded_bytes
+
+
+def transfer_once(spec: DownloadSpec, destination: Path, timeout: float) -> int:
+    try:
+        return transfer_via_https(spec, destination, timeout)
+    except (requests.HTTPError, RuntimeError) as https_error:
+        try:
+            return transfer_via_ftp(spec, destination, timeout)
+        except (OSError, RuntimeError) as ftp_error:
+            raise RuntimeError(
+                f"HTTPS failed ({https_error}); FTP failed ({ftp_error})"
+            ) from ftp_error
 
 
 def download_one(

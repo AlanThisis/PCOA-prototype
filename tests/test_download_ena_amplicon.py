@@ -11,6 +11,7 @@ from download_ena_amplicon import (
     download_one,
     file_report_params,
     format_elapsed,
+    ftp_url,
     parse_file_report,
     select_forward_download,
     transfer_once,
@@ -105,6 +106,12 @@ def test_https_url_strips_whitespace_and_trailing_slash() -> None:
     )
 
 
+def test_ftp_url_restores_ena_native_transport() -> None:
+    assert ftp_url("https://ftp.sra.ebi.ac.uk/run.fastq.gz") == (
+        "ftp://ftp.sra.ebi.ac.uk/run.fastq.gz"
+    )
+
+
 class FakeDownloadResponse:
     def __init__(
         self,
@@ -138,6 +145,25 @@ class FakeDownloadResponse:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+class FakeFtpResponse:
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+        self.offset = 0
+        self.headers = {"Content-Length": str(len(content))}
+
+    def read(self, _: int) -> bytes:
+        if self.offset:
+            return b""
+        self.offset = len(self.content)
+        return self.content
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
 
 
 def make_spec(content: bytes) -> DownloadSpec:
@@ -179,24 +205,62 @@ def test_transfer_restarts_without_range_after_416(
     assert "Range" not in request_headers[1]
 
 
-def test_transfer_rejects_html_error_body_before_writing(
+def test_transfer_discards_stale_partial_and_restarts_after_html(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    spec = make_spec(b"complete-fastq")
+    content = b"complete-fastq"
+    spec = make_spec(content)
     destination = tmp_path / spec.output_filename
+    part_path = destination.with_name(destination.name + ".part")
+    part_path.write_bytes(b"<html>")
     html = b"<html>not a fastq</html>"
-    response = FakeDownloadResponse(200, html, "text/html")
+    responses = [
+        FakeDownloadResponse(200, html, "text/html"),
+        FakeDownloadResponse(200, content),
+    ]
+    request_headers: list[dict[str, str]] = []
+
+    def fake_get(*_: object, **kwargs: object) -> FakeDownloadResponse:
+        request_headers.append(dict(kwargs["headers"]))
+        return responses.pop(0)
+
+    monkeypatch.setattr(download_ena_amplicon.requests, "get", fake_get)
+
+    downloaded = transfer_once(spec, destination, timeout=60)
+
+    assert downloaded == len(content)
+    assert destination.read_bytes() == content
+    assert not part_path.exists()
+    assert request_headers[0]["Range"] == "bytes=6-"
+    assert "Range" not in request_headers[1]
+
+
+def test_transfer_falls_back_to_ftp_after_clean_https_returns_html(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"complete-fastq"
+    spec = make_spec(content)
+    destination = tmp_path / spec.output_filename
+    response = FakeDownloadResponse(200, b"<html>error</html>", "text/html")
     monkeypatch.setattr(
         download_ena_amplicon.requests,
         "get",
         lambda *_args, **_kwargs: response,
     )
+    ftp_requests: list[str] = []
 
-    with pytest.raises(RuntimeError, match="returned HTML"):
-        transfer_once(spec, destination, timeout=60)
+    def fake_urlopen(url: str, **_: object) -> FakeFtpResponse:
+        ftp_requests.append(url)
+        return FakeFtpResponse(content)
 
-    assert not destination.exists()
+    monkeypatch.setattr(download_ena_amplicon, "urlopen", fake_urlopen)
+
+    downloaded = transfer_once(spec, destination, timeout=60)
+
+    assert downloaded == len(content)
+    assert destination.read_bytes() == content
     assert not destination.with_name(destination.name + ".part").exists()
+    assert ftp_requests == ["ftp://ftp.sra.ebi.ac.uk/SRR1_1.fastq.gz"]
 
 
 def test_valid_final_file_removes_stale_partial(
