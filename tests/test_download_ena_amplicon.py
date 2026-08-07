@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
+
+import pytest
+
+import download_ena_amplicon
 from download_ena_amplicon import (
+    DownloadSpec,
+    download_one,
     file_report_params,
     format_elapsed,
     parse_file_report,
     select_forward_download,
+    transfer_once,
 )
 
 
@@ -87,3 +96,90 @@ def test_select_forward_download_rejects_wgs_and_reverse_only_records() -> None:
 
 def test_format_elapsed_supports_accession_runtime_over_24_hours() -> None:
     assert format_elapsed(90061) == "25:01:01"
+
+
+class FakeDownloadResponse:
+    def __init__(self, status_code: int, content: bytes = b"") -> None:
+        self.status_code = status_code
+        self.content = content
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise download_ena_amplicon.requests.HTTPError(
+                f"HTTP {self.status_code}"
+            )
+
+    def iter_content(self, chunk_size: int):
+        del chunk_size
+        yield self.content
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+def make_spec(content: bytes) -> DownloadSpec:
+    return DownloadSpec(
+        project_accession="PRJ1",
+        run_accession="SRR1",
+        library_layout="PAIRED",
+        library_strategy="AMPLICON",
+        url="https://ftp.sra.ebi.ac.uk/SRR1_1.fastq.gz",
+        md5=hashlib.md5(content).hexdigest(),
+        bytes=len(content),
+        output_filename="SRR1_1.fastq.gz",
+    )
+
+
+def test_transfer_restarts_without_range_after_416(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"complete-fastq"
+    spec = make_spec(content)
+    destination = tmp_path / spec.output_filename
+    part_path = tmp_path / f"{spec.output_filename}.part"
+    part_path.write_bytes(b"partial")
+    responses = [FakeDownloadResponse(416), FakeDownloadResponse(200, content)]
+    request_headers: list[dict[str, str]] = []
+
+    def fake_get(*_: object, **kwargs: object) -> FakeDownloadResponse:
+        request_headers.append(dict(kwargs["headers"]))
+        return responses.pop(0)
+
+    monkeypatch.setattr(download_ena_amplicon.requests, "get", fake_get)
+
+    downloaded = transfer_once(spec, destination, timeout=60)
+
+    assert downloaded == len(content)
+    assert destination.read_bytes() == content
+    assert not part_path.exists()
+    assert request_headers[0]["Range"] == "bytes=7-"
+    assert "Range" not in request_headers[1]
+
+
+def test_valid_final_file_removes_stale_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"complete-fastq"
+    spec = make_spec(content)
+    destination = tmp_path / spec.output_filename
+    part_path = tmp_path / f"{spec.output_filename}.part"
+    destination.write_bytes(content)
+    part_path.write_bytes(b"stale")
+    monkeypatch.setattr(
+        download_ena_amplicon.requests,
+        "get",
+        lambda *_args, **_kwargs: pytest.fail("download should be skipped"),
+    )
+
+    result = download_one(spec, tmp_path, retries=3, timeout=60)
+
+    assert result.status == "skipped"
+    assert destination.read_bytes() == content
+    assert not part_path.exists()

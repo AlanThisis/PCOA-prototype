@@ -251,12 +251,25 @@ def transfer_once(spec: DownloadSpec, destination: Path, timeout: float) -> int:
         part_path.unlink()
         existing_bytes = 0
 
-    with requests.get(
+    response = requests.get(
         spec.url,
         headers=headers,
         stream=True,
         timeout=(timeout, timeout),
-    ) as response:
+    )
+    if response.status_code == 416 and existing_bytes > 0:
+        response.close()
+        part_path.unlink()
+        existing_bytes = 0
+        headers.pop("Range", None)
+        response = requests.get(
+            spec.url,
+            headers=headers,
+            stream=True,
+            timeout=(timeout, timeout),
+        )
+
+    with response:
         response.raise_for_status()
         resume_accepted = existing_bytes > 0 and response.status_code == 206
         mode = "ab" if resume_accepted else "wb"
@@ -287,6 +300,7 @@ def download_one(
     started = time.perf_counter()
     destination = output_dir / spec.output_filename
     if completed_file_is_valid(destination, spec):
+        destination.with_name(destination.name + ".part").unlink(missing_ok=True)
         return DownloadResult(
             spec=spec,
             status="skipped",
