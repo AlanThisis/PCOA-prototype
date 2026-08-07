@@ -14,6 +14,7 @@ from download_ena_amplicon import (
     parse_file_report,
     select_forward_download,
     transfer_once,
+    https_url,
 )
 
 
@@ -98,11 +99,26 @@ def test_format_elapsed_supports_accession_runtime_over_24_hours() -> None:
     assert format_elapsed(90061) == "25:01:01"
 
 
+def test_https_url_strips_whitespace_and_trailing_slash() -> None:
+    assert https_url(" ftp.sra.ebi.ac.uk/run.fastq.gz/ \n") == (
+        "https://ftp.sra.ebi.ac.uk/run.fastq.gz"
+    )
+
+
 class FakeDownloadResponse:
-    def __init__(self, status_code: int, content: bytes = b"") -> None:
+    def __init__(
+        self,
+        status_code: int,
+        content: bytes = b"",
+        content_type: str = "application/x-gzip",
+    ) -> None:
         self.status_code = status_code
         self.content = content
         self.closed = False
+        self.headers = {
+            "Content-Type": content_type,
+            "Content-Length": str(len(content)),
+        }
 
     def close(self) -> None:
         self.closed = True
@@ -161,6 +177,26 @@ def test_transfer_restarts_without_range_after_416(
     assert not part_path.exists()
     assert request_headers[0]["Range"] == "bytes=7-"
     assert "Range" not in request_headers[1]
+
+
+def test_transfer_rejects_html_error_body_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = make_spec(b"complete-fastq")
+    destination = tmp_path / spec.output_filename
+    html = b"<html>not a fastq</html>"
+    response = FakeDownloadResponse(200, html, "text/html")
+    monkeypatch.setattr(
+        download_ena_amplicon.requests,
+        "get",
+        lambda *_args, **_kwargs: response,
+    )
+
+    with pytest.raises(RuntimeError, match="returned HTML"):
+        transfer_once(spec, destination, timeout=60)
+
+    assert not destination.exists()
+    assert not destination.with_name(destination.name + ".part").exists()
 
 
 def test_valid_final_file_removes_stale_partial(

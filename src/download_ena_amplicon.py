@@ -87,6 +87,7 @@ def file_report_params(accession: str) -> dict[str, str]:
 
 
 def https_url(raw_url: str) -> str:
+    raw_url = raw_url.strip().rstrip("/")
     if raw_url.startswith("ftp://"):
         return "https://" + raw_url.removeprefix("ftp://")
     if "://" not in raw_url:
@@ -243,6 +244,7 @@ def completed_file_is_valid(path: Path, spec: DownloadSpec) -> bool:
 
 def transfer_once(spec: DownloadSpec, destination: Path, timeout: float) -> int:
     part_path = destination.with_name(destination.name + ".part")
+    download_url = spec.url.strip().rstrip("/")
     existing_bytes = part_path.stat().st_size if part_path.exists() else 0
     headers = {"User-Agent": "ena-amplicon-forward-downloader"}
     if 0 < existing_bytes < spec.bytes:
@@ -252,10 +254,11 @@ def transfer_once(spec: DownloadSpec, destination: Path, timeout: float) -> int:
         existing_bytes = 0
 
     response = requests.get(
-        spec.url,
+        download_url,
         headers=headers,
         stream=True,
         timeout=(timeout, timeout),
+        allow_redirects=False,
     )
     if response.status_code == 416 and existing_bytes > 0:
         response.close()
@@ -263,15 +266,28 @@ def transfer_once(spec: DownloadSpec, destination: Path, timeout: float) -> int:
         existing_bytes = 0
         headers.pop("Range", None)
         response = requests.get(
-            spec.url,
+            download_url,
             headers=headers,
             stream=True,
             timeout=(timeout, timeout),
+            allow_redirects=False,
         )
 
     with response:
         response.raise_for_status()
         resume_accepted = existing_bytes > 0 and response.status_code == 206
+        content_type = response.headers.get("Content-Type", "").lower()
+        if "text/html" in content_type:
+            raise RuntimeError(
+                f"ENA returned HTML instead of FASTQ for {spec.run_accession}"
+            )
+        content_length = response.headers.get("Content-Length")
+        expected_response_bytes = spec.bytes - existing_bytes if resume_accepted else spec.bytes
+        if content_length is not None and int(content_length) != expected_response_bytes:
+            raise RuntimeError(
+                f"HTTP content length mismatch: expected {expected_response_bytes}, "
+                f"got {content_length}"
+            )
         mode = "ab" if resume_accepted else "wb"
         downloaded_bytes = 0
         with part_path.open(mode) as handle:
