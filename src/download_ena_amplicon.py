@@ -17,13 +17,21 @@ from urllib.parse import urlparse
 import requests
 
 
-ENA_PORTAL_SEARCH_BASE = "https://www.ebi.ac.uk/ena/portal/api/search"
+ENA_FILE_REPORT_BASE = "https://www.ebi.ac.uk/ena/portal/api/filereport"
+FILE_REPORT_FIELDS = [
+    "run_accession",
+    "library_layout",
+    "library_strategy",
+    "fastq_ftp",
+    "fastq_md5",
+    "fastq_bytes",
+]
+MANIFEST_ATTEMPTS = 5
 MANIFEST_COLUMNS = [
     "project_accession",
     "run_accession",
     "library_layout",
     "library_strategy",
-    "target_gene",
     "url",
     "md5",
     "bytes",
@@ -43,7 +51,6 @@ class DownloadSpec:
     run_accession: str
     library_layout: str
     library_strategy: str
-    target_gene: str
     url: str
     md5: str
     bytes: int
@@ -70,28 +77,12 @@ def format_elapsed(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-def study_query(accession: str) -> str:
-    field = "study_accession" if accession.startswith("PRJ") else "secondary_study_accession"
-    return f'{field}="{accession}" AND library_strategy="AMPLICON"'
-
-
-def portal_params(accession: str) -> dict[str, str]:
+def file_report_params(accession: str) -> dict[str, str]:
     return {
+        "accession": accession,
         "result": "read_run",
-        "query": study_query(accession),
-        "fields": ",".join(
-            [
-                "run_accession",
-                "library_layout",
-                "library_strategy",
-                "target_gene",
-                "fastq_ftp",
-                "fastq_md5",
-                "fastq_bytes",
-            ]
-        ),
-        "format": "json",
-        "limit": "0",
+        "fields": ",".join(FILE_REPORT_FIELDS),
+        "format": "tsv",
     }
 
 
@@ -114,7 +105,6 @@ def select_forward_download(
     run_accession = str(record.get("run_accession", "") or "").strip()
     layout = str(record.get("library_layout", "") or "").strip().upper()
     strategy = str(record.get("library_strategy", "") or "").strip().upper()
-    target_gene = str(record.get("target_gene", "") or "").strip()
     urls = split_field(record, "fastq_ftp")
     checksums = split_field(record, "fastq_md5")
     sizes = split_field(record, "fastq_bytes")
@@ -164,7 +154,6 @@ def select_forward_download(
         run_accession=run_accession,
         library_layout=layout,
         library_strategy=strategy,
-        target_gene=target_gene,
         url=https_url(raw_url),
         md5=expected_md5.lower(),
         bytes=byte_count,
@@ -172,23 +161,59 @@ def select_forward_download(
     )
 
 
+def parse_file_report(report_text: str) -> list[dict[str, str]]:
+    reader = csv.DictReader(report_text.splitlines(), delimiter="\t")
+    fields = set(reader.fieldnames or [])
+    missing = sorted(set(FILE_REPORT_FIELDS) - fields)
+    if missing:
+        preview = report_text[:500].replace("\n", " ")
+        raise RuntimeError(
+            f"ENA file report missing fields {missing}; response starts with {preview!r}"
+        )
+    records = list(reader)
+    if any(None in record for record in records):
+        raise RuntimeError("ENA file report contains a malformed TSV row")
+    return records
+
+
 def fetch_manifest(accession: str, timeout: float) -> tuple[list[DownloadSpec], list[str]]:
-    response = requests.get(
-        ENA_PORTAL_SEARCH_BASE,
-        params=portal_params(accession),
-        headers={"User-Agent": "ena-amplicon-forward-downloader"},
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    records = response.json()
-    if not isinstance(records, list):
-        raise RuntimeError(f"Unexpected ENA response for {accession}: {records!r}")
+    records: list[dict[str, str]] | None = None
+    last_error: Exception | None = None
+    for attempt in range(1, MANIFEST_ATTEMPTS + 1):
+        try:
+            response = requests.get(
+                ENA_FILE_REPORT_BASE,
+                params=file_report_params(accession),
+                headers={"User-Agent": "ena-amplicon-forward-downloader"},
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            records = parse_file_report(response.text)
+            break
+        except (requests.RequestException, RuntimeError, csv.Error) as exc:
+            last_error = exc
+            if attempt == MANIFEST_ATTEMPTS:
+                break
+            delay = min(5 * (2 ** (attempt - 1)), 60)
+            print(
+                f"ENA manifest attempt {attempt}/{MANIFEST_ATTEMPTS} failed for "
+                f"{accession}: {exc}; retrying in {delay}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+
+    if records is None:
+        raise RuntimeError(
+            f"ENA manifest retrieval failed for {accession} after "
+            f"{MANIFEST_ATTEMPTS} attempts: {last_error}"
+        )
 
     specs: list[DownloadSpec] = []
     skipped: list[str] = []
     for record in records:
-        if not isinstance(record, dict):
-            raise RuntimeError(f"Unexpected ENA run record: {record!r}")
+        if str(record.get("library_strategy", "")).strip().upper() != "AMPLICON":
+            continue
         spec = select_forward_download(accession, record)
         if spec is None:
             run_accession = str(record.get("run_accession", "unknown"))
