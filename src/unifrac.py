@@ -80,8 +80,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sampling-depth",
         type=int,
-        default=None,
-        help="Rarefaction depth (default: minimum sample depth after backbone mapping).",
+        default=1000,
+        help="Rarefaction depth after backbone mapping (default: 1000).",
     )
     parser.add_argument(
         "--threads",

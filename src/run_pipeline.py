@@ -74,7 +74,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="1,0.06,0.02,0.02,0.01,0.005,0.005,0.005,0.001,0.001,0.001,0.0005",
     )
     parser.add_argument("--min-reads", type=int, default=0)
-    parser.add_argument("--sampling-depth", type=int)
+    parser.add_argument(
+        "--sampling-depth",
+        type=int,
+        default=1000,
+        help="Rarefaction depth after Greengenes2 mapping (default: 1000).",
+    )
     parser.add_argument("--gg2-dir", type=Path, default=Path("data/gg2"))
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument(

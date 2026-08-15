@@ -129,9 +129,11 @@ def test_one_study_run_skips_merge_and_writes_manifest_and_state(
     assert command_value(unifrac_command, "--deblur-dir") == (
         run_dir / "work" / "deblur" / "ERP" / "workflow"
     )
+    assert unifrac_command[unifrac_command.index("--sampling-depth") + 1] == "1000"
     manifest = json.loads((run_dir / "run_manifest.json").read_text())
     assert manifest["git_commit"] == "abc123"
     assert manifest["scientific_parameters"]["trim_length"] == 120
+    assert manifest["scientific_parameters"]["sampling_depth"] == 1000
     assert manifest["studies"][0]["fastqs"][0]["path"] == str(
         (study_dir / "ERR1_1.fastq.gz").resolve()
     )
