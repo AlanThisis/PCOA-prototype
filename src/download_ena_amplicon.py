@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import json
+import math
 import shutil
 import subprocess
 import sys
@@ -29,6 +31,8 @@ FILE_REPORT_FIELDS = [
     "fastq_bytes",
 ]
 MANIFEST_ATTEMPTS = 5
+DEFAULT_RECOVERY_ROUNDS = 4
+DEFAULT_MAX_RUNTIME_SECONDS = 2 * 60 * 60
 MANIFEST_COLUMNS = [
     "project_accession",
     "run_accession",
@@ -66,6 +70,17 @@ class DownloadResult:
     elapsed_seconds: float
     downloaded_bytes: int
     message: str = ""
+
+
+@dataclass(frozen=True)
+class ValidationReport:
+    valid_runs: frozenset[str]
+    problems_by_run: dict[str, str]
+    general_problems: tuple[str, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        return not self.problems_by_run and not self.general_problems
 
 
 def utc_now() -> str:
@@ -130,6 +145,22 @@ def select_forward_download(
             (item for item in candidates if Path(urlparse(item[0]).path).name == expected_name),
             None,
         )
+        if selected is None:
+            # ENA documents an unsuffixed archive FASTQ for paired-layout runs
+            # as containing unpaired reads. Retain it only when no mate FASTQs
+            # are present; when _1 exists it remains the forward-read choice.
+            names = {Path(urlparse(item[0]).path).name for item in candidates}
+            unsuffixed_name = f"{run_accession}.fastq.gz"
+            mate_names = {
+                f"{run_accession}_1.fastq.gz",
+                f"{run_accession}_2.fastq.gz",
+            }
+            if unsuffixed_name in names and names.isdisjoint(mate_names):
+                selected = next(
+                    item
+                    for item in candidates
+                    if Path(urlparse(item[0]).path).name == unsuffixed_name
+                )
     elif layout == "SINGLE":
         accepted_names = {
             f"{run_accession}.fastq.gz",
@@ -184,7 +215,9 @@ def parse_file_report(report_text: str) -> list[dict[str, str]]:
     return records
 
 
-def fetch_manifest(accession: str, timeout: float) -> tuple[list[DownloadSpec], list[str]]:
+def fetch_manifest(
+    accession: str, timeout: float
+) -> tuple[list[DownloadSpec], list[tuple[str, str]]]:
     records: list[dict[str, str]] | None = None
     last_error: Exception | None = None
     for attempt in range(1, MANIFEST_ATTEMPTS + 1):
@@ -197,6 +230,8 @@ def fetch_manifest(accession: str, timeout: float) -> tuple[list[DownloadSpec], 
             )
             response.raise_for_status()
             records = parse_file_report(response.text)
+            if not records:
+                raise RuntimeError("ENA returned an empty file report")
             break
         except (requests.RequestException, RuntimeError, csv.Error) as exc:
             last_error = exc
@@ -218,7 +253,7 @@ def fetch_manifest(accession: str, timeout: float) -> tuple[list[DownloadSpec], 
         )
 
     specs: list[DownloadSpec] = []
-    skipped: list[str] = []
+    skipped: list[tuple[str, str]] = []
     for record in records:
         if str(record.get("library_strategy", "")).strip().upper() != "AMPLICON":
             continue
@@ -226,7 +261,10 @@ def fetch_manifest(accession: str, timeout: float) -> tuple[list[DownloadSpec], 
         if spec is None:
             run_accession = str(record.get("run_accession", "unknown"))
             skipped.append(
-                f"{run_accession}: no archive-generated forward FASTQ for its layout"
+                (
+                    run_accession,
+                    "no archive-generated forward FASTQ for its layout",
+                )
             )
         else:
             specs.append(spec)
@@ -246,6 +284,62 @@ def completed_file_is_valid(path: Path, spec: DownloadSpec) -> bool:
         path.is_file()
         and path.stat().st_size == spec.bytes
         and file_md5(path) == spec.md5
+    )
+
+
+def validate_downloads(
+    specs: list[DownloadSpec], output_dir: Path, *, clean_stale_partials: bool = True
+) -> ValidationReport:
+    """Validate every selected FASTQ against the ENA manifest."""
+    valid_runs: set[str] = set()
+    problems_by_run: dict[str, str] = {}
+    expected_parts: set[Path] = set()
+
+    for spec in specs:
+        destination = output_dir / spec.output_filename
+        part_path = destination.with_name(destination.name + ".part")
+        expected_parts.add(part_path)
+        if not destination.is_file():
+            problems_by_run[spec.run_accession] = f"missing {destination.name}"
+            continue
+        actual_size = destination.stat().st_size
+        if actual_size != spec.bytes:
+            problems_by_run[spec.run_accession] = (
+                f"size mismatch: expected {spec.bytes}, got {actual_size}"
+            )
+            continue
+        actual_md5 = file_md5(destination)
+        if actual_md5 != spec.md5:
+            problems_by_run[spec.run_accession] = (
+                f"MD5 mismatch: expected {spec.md5}, got {actual_md5}"
+            )
+            continue
+        valid_runs.add(spec.run_accession)
+        if clean_stale_partials:
+            part_path.unlink(missing_ok=True)
+
+    unexpected_parts = [
+        path for path in sorted(output_dir.glob("*.part")) if path not in expected_parts
+    ]
+    if clean_stale_partials:
+        quarantine_dir = output_dir / ".ena_orphaned_partials"
+        for path in unexpected_parts:
+            quarantine_dir.mkdir(exist_ok=True)
+            target = quarantine_dir / path.name
+            suffix = 1
+            while target.exists():
+                target = quarantine_dir / f"{path.name}.{suffix}"
+                suffix += 1
+            path.replace(target)
+        general_problems: tuple[str, ...] = ()
+    else:
+        general_problems = tuple(
+            f"unexpected partial file: {path.name}" for path in unexpected_parts
+        )
+    return ValidationReport(
+        valid_runs=frozenset(valid_runs),
+        problems_by_run=problems_by_run,
+        general_problems=general_problems,
     )
 
 
@@ -270,43 +364,56 @@ def transfer_via_curl(spec: DownloadSpec, destination: Path, timeout: float) -> 
         raise RuntimeError("curl is not installed")
 
     https = https_url(spec.url)
-    urls = [https, https.replace("https://", "http://", 1), ftp_url(https)]
+    urls = [https, ftp_url(https)]
     errors: list[str] = []
     for url in urls:
-        part_path.unlink(missing_ok=True)
-        result = subprocess.run(
-            [
+        attempts = [True, False] if part_path.exists() else [False]
+        for resume in attempts:
+            if not resume:
+                part_path.unlink(missing_ok=True)
+            existing_bytes = part_path.stat().st_size if resume else 0
+            command = [
                 curl,
                 "--fail",
                 "--location",
                 "--silent",
                 "--show-error",
                 "--connect-timeout",
-                str(timeout),
+                str(math.ceil(timeout)),
                 "--speed-limit",
                 "1",
                 "--speed-time",
-                str(timeout),
+                str(math.ceil(timeout)),
                 "--retry",
                 "2",
                 "--retry-delay",
                 "2",
                 "--output",
                 str(part_path),
-                url,
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            errors.append(f"{url}: curl exit {result.returncode}: {result.stderr.strip()}")
-            continue
-        try:
-            verify_download(spec, part_path, destination)
-            return spec.bytes
-        except (OSError, RuntimeError) as exc:
-            errors.append(f"{url}: {exc}")
+            ]
+            if resume:
+                command.extend(["--continue-at", "-"])
+            command.append(url)
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                errors.append(
+                    f"{url}: curl exit {result.returncode}: {result.stderr.strip()}"
+                )
+                continue
+            try:
+                verify_download(spec, part_path, destination)
+                return spec.bytes - existing_bytes
+            except (OSError, RuntimeError) as exc:
+                errors.append(f"{url}: {exc}")
+                if part_path.exists() and part_path.stat().st_size < spec.bytes:
+                    continue
+                part_path.unlink(missing_ok=True)
+                break
 
     part_path.unlink(missing_ok=True)
     raise RuntimeError("; ".join(errors))
@@ -328,7 +435,7 @@ def transfer_via_https(spec: DownloadSpec, destination: Path, timeout: float) ->
         headers=headers,
         stream=True,
         timeout=(timeout, timeout),
-        allow_redirects=False,
+        allow_redirects=True,
     )
     content_type = response.headers.get("Content-Type", "").lower()
     rejected_resume = response.status_code == 416 or "text/html" in content_type
@@ -377,7 +484,7 @@ def transfer_via_https(spec: DownloadSpec, destination: Path, timeout: float) ->
 def transfer_once(spec: DownloadSpec, destination: Path, timeout: float) -> int:
     try:
         return transfer_via_https(spec, destination, timeout)
-    except (requests.HTTPError, RuntimeError) as https_error:
+    except (requests.RequestException, RuntimeError) as https_error:
         try:
             return transfer_via_curl(spec, destination, timeout)
         except (OSError, RuntimeError) as curl_error:
@@ -394,8 +501,9 @@ def download_one(
 ) -> DownloadResult:
     started = time.perf_counter()
     destination = output_dir / spec.output_filename
+    part_path = destination.with_name(destination.name + ".part")
     if completed_file_is_valid(destination, spec):
-        destination.with_name(destination.name + ".part").unlink(missing_ok=True)
+        part_path.unlink(missing_ok=True)
         return DownloadResult(
             spec=spec,
             status="skipped",
@@ -403,6 +511,19 @@ def download_one(
             downloaded_bytes=0,
             message="existing file passed size and MD5 checks",
         )
+    if part_path.is_file() and part_path.stat().st_size == spec.bytes:
+        try:
+            verify_download(spec, part_path, destination)
+            return DownloadResult(
+                spec=spec,
+                status="downloaded",
+                elapsed_seconds=time.perf_counter() - started,
+                downloaded_bytes=0,
+                message="promoted a complete partial after size and MD5 checks",
+            )
+        except (OSError, RuntimeError):
+            # verify_download removes a full-length partial with the wrong MD5.
+            pass
 
     last_error = ""
     downloaded_bytes = 0
@@ -458,6 +579,28 @@ def write_status(path: Path, results: list[DownloadResult]) -> None:
             writer.writerow(row)
 
 
+def write_unavailable(
+    path: Path, accession: str, unavailable: list[tuple[str, str]]
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["project_accession", "run_accession", "reason"],
+            delimiter="\t",
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        for run_accession, reason in unavailable:
+            writer.writerow(
+                {
+                    "project_accession": accession,
+                    "run_accession": run_accession,
+                    "reason": reason,
+                }
+            )
+
+
 def write_summary(
     path: Path,
     accession: str,
@@ -467,6 +610,9 @@ def write_summary(
     specs: list[DownloadSpec],
     results: list[DownloadResult],
     status: str,
+    recovery_rounds: int,
+    validation_problems: int,
+    unavailable_runs: int,
 ) -> None:
     counts = {
         name: sum(result.status == name for result in results)
@@ -482,28 +628,82 @@ def write_summary(
         "downloaded_runs",
         "skipped_runs",
         "failed_runs",
+        "unavailable_runs",
+        "recovery_rounds",
+        "validation_problems",
         "status",
     ]
+    row: dict[str, object] = {
+        "project_accession": accession,
+        "started_utc": started_at,
+        "ended_utc": ended_at,
+        "elapsed_seconds": f"{elapsed_seconds:.6f}",
+        "elapsed_hms": format_elapsed(elapsed_seconds),
+        "selected_runs": len(specs),
+        "downloaded_runs": counts["downloaded"],
+        "skipped_runs": counts["skipped"],
+        "failed_runs": counts["failed"],
+        "unavailable_runs": unavailable_runs,
+        "recovery_rounds": recovery_rounds,
+        "validation_problems": validation_problems,
+        "status": status,
+    }
     path.parent.mkdir(parents=True, exist_ok=True)
+    previous_rows: list[dict[str, str]] = []
+    if path.is_file():
+        with path.open(newline="", encoding="utf-8") as handle:
+            previous_rows = list(csv.DictReader(handle, delimiter="\t"))
+
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle, fieldnames=columns, delimiter="\t", lineterminator="\n"
         )
         writer.writeheader()
-        writer.writerow(
-            {
-                "project_accession": accession,
-                "started_utc": started_at,
-                "ended_utc": ended_at,
-                "elapsed_seconds": f"{elapsed_seconds:.6f}",
-                "elapsed_hms": format_elapsed(elapsed_seconds),
-                "selected_runs": len(specs),
-                "downloaded_runs": counts["downloaded"],
-                "skipped_runs": counts["skipped"],
-                "failed_runs": counts["failed"],
-                "status": status,
-            }
+        writer.writerow(row)
+
+    history_path = path.with_name("ena_amplicon_forward_history.tsv")
+    history_rows: list[dict[str, str]] = []
+    if history_path.is_file():
+        with history_path.open(newline="", encoding="utf-8") as handle:
+            history_rows = list(csv.DictReader(handle, delimiter="\t"))
+    known_invocations = {
+        (existing.get("started_utc", ""), existing.get("ended_utc", ""))
+        for existing in history_rows
+    }
+    for previous in previous_rows:
+        key = (previous.get("started_utc", ""), previous.get("ended_utc", ""))
+        if key not in known_invocations:
+            history_rows.append(previous)
+            known_invocations.add(key)
+    history_rows.append({name: str(row.get(name, "")) for name in columns})
+    with history_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=columns, delimiter="\t", lineterminator="\n"
         )
+        writer.writeheader()
+        for history_row in history_rows:
+            writer.writerow({name: history_row.get(name, "") for name in columns})
+
+
+def write_completion_marker(
+    path: Path,
+    accession: str,
+    specs: list[DownloadSpec],
+    elapsed_seconds: float,
+    unavailable_runs: int,
+) -> None:
+    payload = {
+        "project_accession": accession,
+        "completed_utc": utc_now(),
+        "selected_fastqs": len(specs),
+        "selected_bytes": sum(spec.bytes for spec in specs),
+        "unavailable_amplicon_runs": unavailable_runs,
+        "elapsed_seconds_this_invocation": round(elapsed_seconds, 6),
+        "validation": "all files passed ENA byte-count and MD5 checks",
+    }
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -534,6 +734,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run", action="store_true", help="Write the manifest without downloading"
     )
+    parser.add_argument(
+        "--recovery-rounds",
+        type=int,
+        default=DEFAULT_RECOVERY_ROUNDS,
+        help=(
+            "Full passes over unresolved FASTQs before exiting incomplete "
+            f"(default: {DEFAULT_RECOVERY_ROUNDS})"
+        ),
+    )
+    parser.add_argument(
+        "--retry-until-complete",
+        action="store_true",
+        help="Keep making recovery passes until complete or --max-runtime is reached",
+    )
+    parser.add_argument(
+        "--max-runtime",
+        type=float,
+        default=DEFAULT_MAX_RUNTIME_SECONDS,
+        help="Soft runtime limit in seconds (default: 7200; 0 disables the limit)",
+    )
+    parser.add_argument(
+        "--allow-missing-forward-fastq",
+        action="store_true",
+        help=(
+            "Permit completion when ENA lists AMPLICON runs without a downloadable "
+            "forward/unpaired archive FASTQ"
+        ),
+    )
     return parser
 
 
@@ -543,26 +771,41 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError(f"Invalid ENA accession: {args.accession!r}")
     if args.workers <= 0 or args.retries <= 0 or args.timeout <= 0:
         raise ValueError("--workers, --retries, and --timeout must be positive")
+    if args.recovery_rounds <= 0:
+        raise ValueError("--recovery-rounds must be positive")
+    if args.max_runtime < 0:
+        raise ValueError("--max-runtime cannot be negative")
 
     output_dir = args.output_dir or Path("data/fastq_data") / accession / "full"
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "ena_amplicon_forward_manifest.tsv"
     status_path = output_dir / "ena_amplicon_forward_status.tsv"
     summary_path = output_dir / "ena_amplicon_forward_summary.tsv"
+    unavailable_path = output_dir / "ena_amplicon_forward_unavailable.tsv"
+    completion_path = output_dir / ".ena_download_complete.json"
 
     started_at = utc_now()
     started = time.perf_counter()
     specs: list[DownloadSpec] = []
     results: list[DownloadResult] = []
+    result_by_run: dict[str, DownloadResult] = {}
+    validation = ValidationReport(frozenset(), {})
+    recovery_rounds = 0
+    unavailable: list[tuple[str, str]] = []
     final_status = "failed"
     try:
         print(f"Querying ENA AMPLICON runs for {accession}...", file=sys.stderr)
-        specs, skipped = fetch_manifest(accession, args.timeout)
+        specs, unavailable = fetch_manifest(accession, args.timeout)
         write_manifest(manifest_path, specs)
-        for message in skipped:
-            print(f"Skipping {message}", file=sys.stderr)
+        write_unavailable(unavailable_path, accession, unavailable)
+        for run_accession, reason in unavailable:
+            print(f"Unavailable {run_accession}: {reason}", file=sys.stderr)
+        if not args.dry_run:
+            completion_path.unlink(missing_ok=True)
         if not specs:
-            raise RuntimeError(f"No downloadable forward AMPLICON FASTQs found for {accession}")
+            raise RuntimeError(
+                f"No downloadable forward AMPLICON FASTQs found for {accession}"
+            )
 
         total_bytes = sum(spec.bytes for spec in specs)
         print(
@@ -575,29 +818,203 @@ def run(args: argparse.Namespace) -> int:
             final_status = "dry-run"
             return 0
 
-        with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            futures = {
-                executor.submit(
-                    download_one, spec, output_dir, args.retries, args.timeout
-                ): spec
+        validation = validate_downloads(specs, output_dir)
+        initially_valid = validation.valid_runs
+        selection_complete = not unavailable or args.allow_missing_forward_fastq
+        if validation.complete:
+            results = [
+                DownloadResult(
+                    spec=spec,
+                    status="skipped",
+                    elapsed_seconds=0.0,
+                    downloaded_bytes=0,
+                    message="existing file passed size and MD5 checks",
+                )
                 for spec in specs
-            }
-            result_by_run: dict[str, DownloadResult] = {}
-            for future in as_completed(futures):
-                result = future.result()
-                result_by_run[result.spec.run_accession] = result
+            ]
+            write_status(status_path, results)
+        else:
+            print(
+                f"Initial validation: {len(initially_valid)}/{len(specs)} FASTQ(s) "
+                "complete.",
+                file=sys.stderr,
+            )
+            results = []
+            for spec in specs:
+                if spec.run_accession in validation.valid_runs:
+                    result = DownloadResult(
+                        spec=spec,
+                        status="skipped",
+                        elapsed_seconds=0.0,
+                        downloaded_bytes=0,
+                        message="existing file passed size and MD5 checks",
+                    )
+                else:
+                    result = DownloadResult(
+                        spec=spec,
+                        status="failed",
+                        elapsed_seconds=0.0,
+                        downloaded_bytes=0,
+                        message=validation.problems_by_run.get(
+                            spec.run_accession, "initial validation failed"
+                        ),
+                    )
+                result_by_run[spec.run_accession] = result
+                results.append(result)
+            write_status(status_path, results)
+
+        while not validation.complete:
+            elapsed = time.perf_counter() - started
+            if args.max_runtime and elapsed >= args.max_runtime:
                 print(
-                    f"[{result.status}] {result.spec.run_accession} "
-                    f"{format_elapsed(result.elapsed_seconds)} {result.message}",
+                    f"Stopping recovery after reaching the {format_elapsed(args.max_runtime)} "
+                    "soft runtime limit.",
+                    file=sys.stderr,
+                )
+                break
+            if not args.retry_until_complete and recovery_rounds >= args.recovery_rounds:
+                break
+
+            recovery_rounds += 1
+            unresolved = [
+                spec
+                for spec in specs
+                if spec.run_accession not in validation.valid_runs
+            ]
+            if recovery_rounds > 1:
+                delay = min(15 * (2 ** (recovery_rounds - 2)), 300)
+                if args.max_runtime:
+                    remaining = args.max_runtime - (time.perf_counter() - started)
+                    if remaining <= 0:
+                        break
+                    delay = min(delay, max(0, remaining))
+                print(
+                    f"Recovery round {recovery_rounds}: retrying {len(unresolved)} "
+                    f"FASTQ(s) after {delay:.0f}s...",
                     file=sys.stderr,
                     flush=True,
                 )
+                time.sleep(delay)
+                if (
+                    args.max_runtime
+                    and time.perf_counter() - started >= args.max_runtime
+                ):
+                    break
+            else:
+                print(
+                    f"Download round {recovery_rounds}: {len(unresolved)} FASTQ(s) "
+                    "need transfer or repair.",
+                    file=sys.stderr,
+                )
 
-        results = [result_by_run[spec.run_accession] for spec in specs]
-        write_status(status_path, results)
-        failed = [result for result in results if result.status == "failed"]
-        final_status = "failed" if failed else "completed"
-        return 1 if failed else 0
+            with ThreadPoolExecutor(max_workers=args.workers) as executor:
+                futures = {
+                    executor.submit(
+                        download_one, spec, output_dir, args.retries, args.timeout
+                    ): spec
+                    for spec in unresolved
+                }
+                for future in as_completed(futures):
+                    spec = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:  # preserve the rest of the batch
+                        result = DownloadResult(
+                            spec=spec,
+                            status="failed",
+                            elapsed_seconds=0.0,
+                            downloaded_bytes=0,
+                            message=f"unexpected worker error: {exc}",
+                        )
+                    result_by_run[result.spec.run_accession] = result
+                    print(
+                        f"[{result.status}] {result.spec.run_accession} "
+                        f"{format_elapsed(result.elapsed_seconds)} {result.message}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+            validation = validate_downloads(specs, output_dir)
+            for spec in specs:
+                if spec.run_accession in validation.valid_runs:
+                    result_by_run.setdefault(
+                        spec.run_accession,
+                        DownloadResult(
+                            spec=spec,
+                            status="skipped",
+                            elapsed_seconds=0.0,
+                            downloaded_bytes=0,
+                            message="existing file passed size and MD5 checks",
+                        ),
+                    )
+                else:
+                    previous = result_by_run.get(spec.run_accession)
+                    validation_message = validation.problems_by_run.get(
+                        spec.run_accession, "final validation failed"
+                    )
+                    if previous and previous.message:
+                        message = (
+                            f"{previous.message}; validation: {validation_message}"
+                        )
+                    else:
+                        message = validation_message
+                    result_by_run[spec.run_accession] = DownloadResult(
+                        spec=spec,
+                        status="failed",
+                        elapsed_seconds=previous.elapsed_seconds if previous else 0.0,
+                        downloaded_bytes=previous.downloaded_bytes if previous else 0,
+                        message=message,
+                    )
+            results = [result_by_run[spec.run_accession] for spec in specs]
+            write_status(status_path, results)
+            print(
+                f"Validation after round {recovery_rounds}: "
+                f"{len(validation.valid_runs)}/{len(specs)} FASTQ(s) complete.",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        if validation.complete and selection_complete:
+            final_status = "completed"
+            write_completion_marker(
+                completion_path,
+                accession,
+                specs,
+                time.perf_counter() - started,
+                len(unavailable),
+            )
+            print(
+                f"VALIDATION PASSED: all {len(specs)} selected FASTQ(s) passed "
+                "size and MD5 checks.",
+                file=sys.stderr,
+            )
+            print(f"Completion marker: {completion_path}", file=sys.stderr)
+            return 0
+
+        final_status = "incomplete"
+        problem_count = len(validation.problems_by_run) + len(
+            validation.general_problems
+        ) + (0 if args.allow_missing_forward_fastq else len(unavailable))
+        print(
+            f"INCOMPLETE: {len(validation.valid_runs)}/{len(specs)} FASTQ(s) "
+            f"validated; {problem_count} problem(s) remain.",
+            file=sys.stderr,
+        )
+        for run_accession, message in validation.problems_by_run.items():
+            print(f"  - {run_accession}: {message}", file=sys.stderr)
+        for message in validation.general_problems:
+            print(f"  - {message}", file=sys.stderr)
+        if unavailable and not args.allow_missing_forward_fastq:
+            print(
+                f"  - {len(unavailable)} AMPLICON run(s) lack a downloadable "
+                f"forward/unpaired archive FASTQ; see {unavailable_path}",
+                file=sys.stderr,
+            )
+        print(
+            "Safe to rerun the same command; verified files will be skipped.",
+            file=sys.stderr,
+        )
+        return 1
     finally:
         elapsed = time.perf_counter() - started
         ended_at = utc_now()
@@ -610,6 +1027,11 @@ def run(args: argparse.Namespace) -> int:
             specs,
             results,
             final_status,
+            recovery_rounds,
+            len(validation.problems_by_run)
+            + len(validation.general_problems)
+            + (0 if args.allow_missing_forward_fastq else len(unavailable)),
+            len(unavailable),
         )
         print(
             f"Accession {accession} finished in {format_elapsed(elapsed)} "

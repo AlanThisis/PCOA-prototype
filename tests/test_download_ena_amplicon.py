@@ -1,20 +1,26 @@
 from __future__ import annotations
 
+import csv
 import hashlib
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import download_ena_amplicon
 from download_ena_amplicon import (
     DownloadSpec,
+    DownloadResult,
     download_one,
+    fetch_manifest,
     file_report_params,
     format_elapsed,
     ftp_url,
     parse_file_report,
     select_forward_download,
     transfer_once,
+    validate_downloads,
     https_url,
 )
 
@@ -37,6 +43,48 @@ def test_parse_file_report_rejects_ena_error_response() -> None:
         assert "missing fields" in str(exc)
     else:
         raise AssertionError("Malformed ENA response was accepted")
+
+
+def test_fetch_manifest_retries_a_transient_empty_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    header = "\t".join(download_ena_amplicon.FILE_REPORT_FIELDS)
+    complete_report = "\n".join(
+        [
+            header,
+            "\t".join(
+                [
+                    "SRR1",
+                    "SINGLE",
+                    "AMPLICON",
+                    "ftp.sra.ebi.ac.uk/SRR1.fastq.gz",
+                    "abc",
+                    "100",
+                ]
+            ),
+        ]
+    )
+    responses = [header + "\n", complete_report]
+
+    class FakeManifestResponse:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+        def raise_for_status(self) -> None:
+            return None
+
+    def fake_get(*_: object, **__: object) -> FakeManifestResponse:
+        return FakeManifestResponse(responses.pop(0))
+
+    monkeypatch.setattr(download_ena_amplicon.requests, "get", fake_get)
+    monkeypatch.setattr(download_ena_amplicon.time, "sleep", lambda _: None)
+
+    specs, unavailable = fetch_manifest("PRJ1", timeout=1)
+
+    assert len(specs) == 1
+    assert specs[0].run_accession == "SRR1"
+    assert unavailable == []
+    assert responses == []
 
 
 def test_select_forward_download_chooses_only_first_mate() -> None:
@@ -94,6 +142,44 @@ def test_select_forward_download_rejects_wgs_and_reverse_only_records() -> None:
 
     assert select_forward_download("ERP1", wgs_record) is None
     assert select_forward_download("ERP1", reverse_only_record) is None
+
+
+def test_select_forward_download_accepts_only_unpaired_file_from_paired_layout() -> None:
+    record = {
+        "run_accession": "ERR500",
+        "library_layout": "PAIRED",
+        "library_strategy": "AMPLICON",
+        "fastq_ftp": "ftp.sra.ebi.ac.uk/ERR500.fastq.gz",
+        "fastq_md5": "abc",
+        "fastq_bytes": "100",
+    }
+
+    spec = select_forward_download("ERP1", record)
+
+    assert spec is not None
+    assert spec.url == "https://ftp.sra.ebi.ac.uk/ERR500.fastq.gz"
+    assert spec.output_filename == "ERR500_1.fastq.gz"
+
+
+def test_select_forward_download_prefers_forward_mate_over_unpaired_file() -> None:
+    record = {
+        "run_accession": "ERR600",
+        "library_layout": "PAIRED",
+        "library_strategy": "AMPLICON",
+        "fastq_ftp": (
+            "ftp.sra.ebi.ac.uk/ERR600.fastq.gz;"
+            "ftp.sra.ebi.ac.uk/ERR600_1.fastq.gz;"
+            "ftp.sra.ebi.ac.uk/ERR600_2.fastq.gz"
+        ),
+        "fastq_md5": "unpaired;forward;reverse",
+        "fastq_bytes": "50;100;100",
+    }
+
+    spec = select_forward_download("ERP1", record)
+
+    assert spec is not None
+    assert spec.md5 == "forward"
+    assert spec.output_filename == "ERR600_1.fastq.gz"
 
 
 def test_format_elapsed_supports_accession_runtime_over_24_hours() -> None:
@@ -247,6 +333,62 @@ def test_transfer_falls_back_to_verified_curl_after_python_https_returns_html(
     assert curl_requests == ["https://ftp.sra.ebi.ac.uk/SRR1_1.fastq.gz"]
 
 
+def test_transfer_falls_back_to_curl_after_requests_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"complete-fastq"
+    spec = make_spec(content)
+    destination = tmp_path / spec.output_filename
+    monkeypatch.setattr(
+        download_ena_amplicon.requests,
+        "get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            download_ena_amplicon.requests.Timeout("timed out")
+        ),
+    )
+
+    def fake_curl(
+        received_spec: DownloadSpec, received_destination: Path, timeout: float
+    ) -> int:
+        assert received_spec == spec
+        assert timeout == 60
+        received_destination.write_bytes(content)
+        return len(content)
+
+    monkeypatch.setattr(download_ena_amplicon, "transfer_via_curl", fake_curl)
+
+    assert transfer_once(spec, destination, timeout=60) == len(content)
+    assert destination.read_bytes() == content
+
+
+def test_curl_receives_integer_timeout_and_resumes_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"complete-fastq"
+    spec = make_spec(content)
+    destination = tmp_path / spec.output_filename
+    part_path = destination.with_name(destination.name + ".part")
+    part_path.write_bytes(content[:4])
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_: object) -> object:
+        commands.append(command)
+        part_path.write_bytes(content)
+        return type("Result", (), {"returncode": 0, "stderr": ""})()
+
+    monkeypatch.setattr(download_ena_amplicon.shutil, "which", lambda _: "/usr/bin/curl")
+    monkeypatch.setattr(download_ena_amplicon.subprocess, "run", fake_run)
+
+    downloaded = download_ena_amplicon.transfer_via_curl(
+        spec, destination, timeout=60.0
+    )
+
+    assert downloaded == len(content) - 4
+    assert "--continue-at" in commands[0]
+    assert commands[0][commands[0].index("--speed-time") + 1] == "60"
+    assert destination.read_bytes() == content
+
+
 def test_valid_final_file_removes_stale_partial(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -267,3 +409,253 @@ def test_valid_final_file_removes_stale_partial(
     assert result.status == "skipped"
     assert destination.read_bytes() == content
     assert not part_path.exists()
+
+
+def test_complete_partial_is_verified_and_promoted_without_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"complete-fastq"
+    spec = make_spec(content)
+    destination = tmp_path / spec.output_filename
+    part_path = destination.with_name(destination.name + ".part")
+    part_path.write_bytes(content)
+    monkeypatch.setattr(
+        download_ena_amplicon.requests,
+        "get",
+        lambda *_args, **_kwargs: pytest.fail("download should not be attempted"),
+    )
+
+    result = download_one(spec, tmp_path, retries=3, timeout=60)
+
+    assert result.status == "downloaded"
+    assert "promoted" in result.message
+    assert destination.read_bytes() == content
+    assert not part_path.exists()
+
+
+def test_validation_checks_all_files_and_cleans_stale_partials(tmp_path: Path) -> None:
+    content = b"complete-fastq"
+    spec = make_spec(content)
+    destination = tmp_path / spec.output_filename
+    destination.write_bytes(content)
+    destination.with_name(destination.name + ".part").write_bytes(b"stale")
+    (tmp_path / "obsolete.fastq.gz.part").write_bytes(b"stale")
+
+    report = validate_downloads([spec], tmp_path)
+
+    assert report.complete
+    assert report.valid_runs == frozenset({spec.run_accession})
+    assert not list(tmp_path.glob("*.part"))
+    assert (tmp_path / ".ena_orphaned_partials" / "obsolete.fastq.gz.part").is_file()
+
+
+def make_run_args(output_dir: Path, **overrides: object) -> SimpleNamespace:
+    values: dict[str, object] = {
+        "accession": "PRJ1",
+        "output_dir": output_dir,
+        "workers": 1,
+        "retries": 1,
+        "timeout": 1.0,
+        "dry_run": False,
+        "recovery_rounds": 2,
+        "retry_until_complete": False,
+        "max_runtime": 60.0,
+        "allow_missing_forward_fastq": False,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_run_exits_success_only_after_final_validation_and_writes_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"complete-fastq"
+    spec = make_spec(content)
+    monkeypatch.setattr(
+        download_ena_amplicon, "fetch_manifest", lambda *_: ([spec], [])
+    )
+
+    def fake_download(
+        received_spec: DownloadSpec,
+        output_dir: Path,
+        retries: int,
+        timeout: float,
+    ) -> DownloadResult:
+        del retries, timeout
+        (output_dir / received_spec.output_filename).write_bytes(content)
+        return DownloadResult(received_spec, "downloaded", 0.1, len(content), "ok")
+
+    monkeypatch.setattr(download_ena_amplicon, "download_one", fake_download)
+
+    assert download_ena_amplicon.run(make_run_args(tmp_path)) == 0
+    marker_path = tmp_path / ".ena_download_complete.json"
+    marker = json.loads(marker_path.read_text())
+    assert marker["project_accession"] == "PRJ1"
+    assert marker["selected_fastqs"] == 1
+    assert marker["validation"].startswith("all files passed")
+    assert "\tcompleted\n" in (
+        tmp_path / "ena_amplicon_forward_summary.tsv"
+    ).read_text()
+
+
+def test_run_retries_revalidates_and_exits_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"complete-fastq"
+    spec = make_spec(content)
+    attempts = 0
+    monkeypatch.setattr(
+        download_ena_amplicon, "fetch_manifest", lambda *_: ([spec], [])
+    )
+    monkeypatch.setattr(download_ena_amplicon.time, "sleep", lambda _: None)
+
+    def fake_failure(*_: object, **__: object) -> DownloadResult:
+        nonlocal attempts
+        attempts += 1
+        return DownloadResult(spec, "failed", 0.1, 0, "ENA unavailable")
+
+    monkeypatch.setattr(download_ena_amplicon, "download_one", fake_failure)
+
+    assert download_ena_amplicon.run(make_run_args(tmp_path)) == 1
+    assert attempts == 2
+    assert not (tmp_path / ".ena_download_complete.json").exists()
+    status = (tmp_path / "ena_amplicon_forward_status.tsv").read_text()
+    assert "failed" in status
+    assert "ENA unavailable" in status
+    assert "\tincomplete\n" in (
+        tmp_path / "ena_amplicon_forward_summary.tsv"
+    ).read_text()
+
+
+def test_runtime_limit_before_first_recovery_writes_current_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"complete-fastq"
+    spec = make_spec(content)
+    monkeypatch.setattr(
+        download_ena_amplicon, "fetch_manifest", lambda *_: ([spec], [])
+    )
+    monkeypatch.setattr(
+        download_ena_amplicon,
+        "download_one",
+        lambda *_args, **_kwargs: pytest.fail("download should not start"),
+    )
+
+    args = make_run_args(tmp_path, max_runtime=1e-12)
+    assert download_ena_amplicon.run(args) == 1
+
+    status_path = tmp_path / "ena_amplicon_forward_status.tsv"
+    with status_path.open(newline="", encoding="utf-8") as handle:
+        statuses = list(csv.DictReader(handle, delimiter="\t"))
+    assert len(statuses) == 1
+    assert statuses[0]["run_accession"] == spec.run_accession
+    assert statuses[0]["status"] == "failed"
+    assert "missing" in statuses[0]["message"]
+
+
+def test_run_recovers_on_a_later_full_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"complete-fastq"
+    spec = make_spec(content)
+    attempts = 0
+    monkeypatch.setattr(
+        download_ena_amplicon, "fetch_manifest", lambda *_: ([spec], [])
+    )
+    monkeypatch.setattr(download_ena_amplicon.time, "sleep", lambda _: None)
+
+    def fail_then_succeed(
+        received_spec: DownloadSpec,
+        output_dir: Path,
+        *_: object,
+    ) -> DownloadResult:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return DownloadResult(
+                received_spec, "failed", 0.1, 0, "temporary ENA failure"
+            )
+        (output_dir / received_spec.output_filename).write_bytes(content)
+        return DownloadResult(
+            received_spec, "downloaded", 0.1, len(content), "recovered"
+        )
+
+    monkeypatch.setattr(download_ena_amplicon, "download_one", fail_then_succeed)
+
+    assert download_ena_amplicon.run(make_run_args(tmp_path)) == 0
+    assert attempts == 2
+    assert (tmp_path / ".ena_download_complete.json").exists()
+    summary = (tmp_path / "ena_amplicon_forward_summary.tsv").read_text()
+    assert "\t2\t0\tcompleted\n" in summary
+
+
+def test_run_refuses_completion_when_amplicon_run_has_no_forward_fastq(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"complete-fastq"
+    spec = make_spec(content)
+    (tmp_path / spec.output_filename).write_bytes(content)
+    monkeypatch.setattr(
+        download_ena_amplicon,
+        "fetch_manifest",
+        lambda *_: ([spec], [("SRR2", "no forward archive FASTQ")]),
+    )
+
+    assert download_ena_amplicon.run(make_run_args(tmp_path)) == 1
+    assert not (tmp_path / ".ena_download_complete.json").exists()
+    unavailable = (tmp_path / "ena_amplicon_forward_unavailable.tsv").read_text()
+    assert "SRR2" in unavailable
+    assert "no forward archive FASTQ" in unavailable
+
+
+def test_run_can_explicitly_allow_amplicon_run_without_forward_fastq(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"complete-fastq"
+    spec = make_spec(content)
+    (tmp_path / spec.output_filename).write_bytes(content)
+    monkeypatch.setattr(
+        download_ena_amplicon,
+        "fetch_manifest",
+        lambda *_: ([spec], [("SRR2", "no forward archive FASTQ")]),
+    )
+
+    args = make_run_args(tmp_path, allow_missing_forward_fastq=True)
+    assert download_ena_amplicon.run(args) == 0
+    marker = json.loads((tmp_path / ".ena_download_complete.json").read_text())
+    assert marker["unavailable_amplicon_runs"] == 1
+
+
+def test_summary_history_preserves_multiple_invocations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"complete-fastq"
+    spec = make_spec(content)
+    (tmp_path / spec.output_filename).write_bytes(content)
+    monkeypatch.setattr(
+        download_ena_amplicon, "fetch_manifest", lambda *_: ([spec], [])
+    )
+
+    assert download_ena_amplicon.run(make_run_args(tmp_path)) == 0
+    assert download_ena_amplicon.run(make_run_args(tmp_path)) == 0
+
+    history_path = tmp_path / "ena_amplicon_forward_history.tsv"
+    with history_path.open(newline="", encoding="utf-8") as handle:
+        history = list(csv.DictReader(handle, delimiter="\t"))
+    assert len(history) == 2
+    assert all(row["status"] == "completed" for row in history)
+
+
+def test_non_dry_run_with_no_downloadable_fastqs_invalidates_old_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / ".ena_download_complete.json"
+    marker.write_text("stale")
+    monkeypatch.setattr(
+        download_ena_amplicon, "fetch_manifest", lambda *_: ([], [])
+    )
+
+    with pytest.raises(RuntimeError, match="No downloadable"):
+        download_ena_amplicon.run(make_run_args(tmp_path))
+
+    assert not marker.exists()
