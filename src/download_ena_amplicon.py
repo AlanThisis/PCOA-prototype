@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -269,6 +270,99 @@ def fetch_manifest(
         else:
             specs.append(spec)
     return specs, skipped
+
+
+def load_approved_runs(path: Path, accession: str) -> frozenset[str]:
+    """Load the exact runs approved for one project from a global TSV allowlist."""
+    if not path.is_file() or path.stat().st_size == 0:
+        raise FileNotFoundError(f"Exact-run manifest not found or empty: {path}")
+
+    approved: set[str] = set()
+    seen_runs: set[str] = set()
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        required = {"project_accession", "run_accession"}
+        missing_columns = sorted(required - set(reader.fieldnames or []))
+        if missing_columns:
+            raise ValueError(
+                f"Exact-run manifest is missing columns: {missing_columns}"
+            )
+        for line_number, row in enumerate(reader, start=2):
+            project = (row.get("project_accession") or "").strip().upper()
+            run_accession = (row.get("run_accession") or "").strip().upper()
+            if not project or not run_accession:
+                raise ValueError(
+                    f"Exact-run manifest row {line_number} has an empty project or run"
+                )
+            if run_accession in seen_runs:
+                raise ValueError(
+                    f"Duplicate run accession in exact-run manifest: {run_accession}"
+                )
+            seen_runs.add(run_accession)
+            if project == accession:
+                approved.add(run_accession)
+
+    if not approved:
+        raise ValueError(
+            f"Exact-run manifest contains no approved runs for {accession}"
+        )
+    return frozenset(approved)
+
+
+def select_approved_manifest(
+    specs: list[DownloadSpec],
+    unavailable: list[tuple[str, str]],
+    approved_runs: frozenset[str],
+) -> tuple[list[DownloadSpec], list[tuple[str, str]]]:
+    """Restrict ENA results to approved runs and fail if any cannot be selected."""
+    counts = Counter(spec.run_accession for spec in specs)
+    duplicates = sorted(run for run, count in counts.items() if count > 1)
+    if duplicates:
+        raise RuntimeError(f"ENA returned duplicate selected runs: {duplicates[:10]}")
+
+    selected = [spec for spec in specs if spec.run_accession in approved_runs]
+    selected_runs = {spec.run_accession for spec in selected}
+    unavailable_by_run = dict(unavailable)
+    missing = sorted(approved_runs - selected_runs)
+    if missing:
+        details = [
+            f"{run}: {unavailable_by_run.get(run, 'not returned as a downloadable AMPLICON run')}"
+            for run in missing[:20]
+        ]
+        suffix = "" if len(missing) <= 20 else f"; plus {len(missing) - 20} more"
+        raise RuntimeError(
+            f"{len(missing)} approved run(s) could not be selected from ENA: "
+            + "; ".join(details)
+            + suffix
+        )
+    return selected, [item for item in unavailable if item[0] in approved_runs]
+
+
+def quarantine_unapproved_fastqs(
+    output_dir: Path, specs: list[DownloadSpec]
+) -> list[Path]:
+    """Move top-level FASTQs outside an exact allowlist away from pipeline inputs."""
+    expected = {spec.output_filename for spec in specs}
+    extras = sorted(
+        path
+        for path in output_dir.glob("*.fastq.gz")
+        if path.is_file() and path.name not in expected
+    )
+    if not extras:
+        return []
+    quarantine_dir = output_dir / "unapproved_fastqs"
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    moved: list[Path] = []
+    for source in extras:
+        destination = quarantine_dir / source.name
+        if destination.exists():
+            raise RuntimeError(
+                f"Cannot quarantine unapproved FASTQ because destination exists: "
+                f"{destination}"
+            )
+        source.replace(destination)
+        moved.append(destination)
+    return moved
 
 
 def file_md5(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
@@ -720,6 +814,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Destination (default: data/fastq_data/<accession>/full)",
     )
     parser.add_argument(
+        "--run-manifest",
+        type=Path,
+        help=(
+            "Optional tab-delimited exact-run allowlist with project_accession "
+            "and run_accession columns"
+        ),
+    )
+    parser.add_argument(
         "--workers", type=int, default=8, help="Concurrent downloads (default: 8)"
     )
     parser.add_argument(
@@ -783,6 +885,8 @@ def run(args: argparse.Namespace) -> int:
     summary_path = output_dir / "ena_amplicon_forward_summary.tsv"
     unavailable_path = output_dir / "ena_amplicon_forward_unavailable.tsv"
     completion_path = output_dir / ".ena_download_complete.json"
+    if not args.dry_run:
+        completion_path.unlink(missing_ok=True)
 
     started_at = utc_now()
     started = time.perf_counter()
@@ -796,12 +900,29 @@ def run(args: argparse.Namespace) -> int:
     try:
         print(f"Querying ENA AMPLICON runs for {accession}...", file=sys.stderr)
         specs, unavailable = fetch_manifest(accession, args.timeout)
+        run_manifest = getattr(args, "run_manifest", None)
+        if run_manifest is not None:
+            approved_runs = load_approved_runs(run_manifest, accession)
+            specs, unavailable = select_approved_manifest(
+                specs, unavailable, approved_runs
+            )
+            print(
+                f"Exact-run manifest approved {len(approved_runs)} run(s) for "
+                f"{accession}.",
+                file=sys.stderr,
+            )
+            if not args.dry_run:
+                quarantined = quarantine_unapproved_fastqs(output_dir, specs)
+                if quarantined:
+                    print(
+                        f"Quarantined {len(quarantined)} pre-existing unapproved "
+                        f"FASTQ(s) under {output_dir / 'unapproved_fastqs'}.",
+                        file=sys.stderr,
+                    )
         write_manifest(manifest_path, specs)
         write_unavailable(unavailable_path, accession, unavailable)
         for run_accession, reason in unavailable:
             print(f"Unavailable {run_accession}: {reason}", file=sys.stderr)
-        if not args.dry_run:
-            completion_path.unlink(missing_ok=True)
         if not specs:
             raise RuntimeError(
                 f"No downloadable forward AMPLICON FASTQs found for {accession}"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,8 +18,11 @@ from download_ena_amplicon import (
     file_report_params,
     format_elapsed,
     ftp_url,
+    load_approved_runs,
     parse_file_report,
+    quarantine_unapproved_fastqs,
     select_forward_download,
+    select_approved_manifest,
     transfer_once,
     validate_downloads,
     https_url,
@@ -85,6 +89,56 @@ def test_fetch_manifest_retries_a_transient_empty_report(
     assert specs[0].run_accession == "SRR1"
     assert unavailable == []
     assert responses == []
+
+
+def test_exact_run_manifest_selects_only_allowlisted_project_runs(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "approved.tsv"
+    manifest.write_text(
+        "project_accession\trun_accession\tsample_id\n"
+        "PRJ1\tSRR1\tSRR1\n"
+        "PRJ2\tSRR9\tSRR9\n",
+        encoding="utf-8",
+    )
+    approved = load_approved_runs(manifest, "PRJ1")
+    specs = [
+        replace(make_spec(b"one"), run_accession="SRR1"),
+        replace(make_spec(b"two"), run_accession="SRR2"),
+    ]
+
+    selected, unavailable = select_approved_manifest(specs, [], approved)
+
+    assert [spec.run_accession for spec in selected] == ["SRR1"]
+    assert unavailable == []
+
+
+def test_exact_run_manifest_fails_when_approved_run_is_missing(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "approved.tsv"
+    manifest.write_text(
+        "project_accession\trun_accession\nPRJ1\tSRR_MISSING\n",
+        encoding="utf-8",
+    )
+    approved = load_approved_runs(manifest, "PRJ1")
+
+    with pytest.raises(RuntimeError, match="SRR_MISSING"):
+        select_approved_manifest([], [], approved)
+
+
+def test_exact_run_download_quarantines_preexisting_unapproved_fastq(
+    tmp_path: Path,
+) -> None:
+    spec = make_spec(b"approved")
+    extra = tmp_path / "SRR_EXTRA_1.fastq.gz"
+    extra.write_bytes(b"not approved")
+
+    moved = quarantine_unapproved_fastqs(tmp_path, [spec])
+
+    assert moved == [tmp_path / "unapproved_fastqs" / extra.name]
+    assert moved[0].read_bytes() == b"not approved"
+    assert not extra.exists()
 
 
 def test_select_forward_download_chooses_only_first_mate() -> None:
