@@ -93,8 +93,41 @@ wget -P data/gg2 https://ftp.microbio.me/greengenes_release/current/2024.09.phyl
 ### 1. Download
 
 ```bash
-fastq-dl --accession PRJEB44533 --provider ena --outdir data/fastq_data/PRJEB44533/full
+python src/download_ena_amplicon.py PRJEB44533 \
+  --output-dir data/fastq_data/PRJEB44533/full \
+  --workers 8
 ```
+
+The downloader queries ENA first and selects only `AMPLICON` runs. For paired
+runs it downloads `_1.fastq.gz`. When ENA documents a paired-layout run with
+only an unsuffixed archive FASTQ, that file contains unpaired reads and is
+retained. Single-end and unpaired FASTQs are normalized to the `_1.fastq.gz`
+naming convention.
+
+Downloads are concurrent, resumable through `.part` files, and checked against
+ENA's reported byte count and MD5. Failed files receive multiple recovery
+passes with backoff. The command exits successfully only after every selected
+FASTQ passes final validation, then writes `.ena_download_complete.json` in the
+output directory. The manifest, per-run status, and project summary TSVs are
+updated on every invocation. `ena_amplicon_forward_history.tsv` retains the
+timing and outcome of every invocation, including the initial download and any
+later repair or validation passes. Rerunning the same command is safe: verified
+files are skipped and only incomplete files are repaired.
+
+For an unattended job that should keep retrying within a wall-time budget:
+
+```bash
+python src/download_ena_amplicon.py PRJEB44533 \
+  --output-dir data/fastq_data/PRJEB44533/full \
+  --workers 4 \
+  --retry-until-complete \
+  --max-runtime 82800
+```
+
+`--max-runtime` is a soft limit in seconds; `82800` leaves one hour of margin in
+a 24-hour SLURM allocation. If the command exits incomplete, run the identical
+command again to resume. Use `--dry-run` to inspect the selected files and total
+size without downloading or invalidating an existing completion marker.
 
 ### 2. Fetch Metadata
 
@@ -185,7 +218,7 @@ Study names and sample identifiers must be unique. For a single study, the
 merge stage is skipped and that study's Deblur workflow is passed directly to
 UniFrac.
 
-`unifrac.py` uses GG2's `non-v4-16s` closed-reference action (vsearch at 99%) to map Deblur ASVs onto the GG2 backbone, then computes UniFrac against the GG2 ID phylogeny. Rarefaction depth defaults to the minimum sample depth after backbone mapping; override with `--sampling-depth`.
+`unifrac.py` uses GG2's `non-v4-16s` closed-reference action (vsearch at 99%) to map Deblur ASVs onto the GG2 backbone, then computes UniFrac against the GG2 ID phylogeny. Rarefaction depth defaults to 1,000 reads after backbone mapping; override with `--sampling-depth`.
 
 ### Resume a Failed Run
 
@@ -291,7 +324,7 @@ For `unifrac.py`, the detailed operations distinguish:
 
 - QIIME2 feature-table and representative-sequence imports
 - Greengenes2 `non-v4-16s` backbone mapping
-- mapped-table export and automatic sampling-depth calculation
+- mapped-table export and rarefaction-depth handling
 - feature-table rarefaction
 - `diversity beta-phylogenetic`, the actual unweighted UniFrac calculation
 - `diversity pcoa`
