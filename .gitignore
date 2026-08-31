@@ -23,3 +23,7 @@ work/
 runs/
 deblur.log
 slides/
+
+# SLURM scheduler output written beside the submission directory
+slurm-*.out
+slurm-*.err

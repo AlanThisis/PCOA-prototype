@@ -247,37 +247,13 @@ are preserved. When Deblur or merge reruns, the orchestrator refreshes QIIME2's
 imported table, representative sequences, and GG2 mapping instead of reusing
 stale upstream artifacts.
 
-### Generic SLURM Wrapper
+### SLURM wrappers
 
-SLURM should only allocate resources, activate the environment, choose a unique
-run path, and invoke the Python orchestrator. Keep project-specific job scripts
-local rather than adding one script per dataset to the repository.
-
-```bash
-#!/usr/bin/env bash
-#SBATCH --partition=short
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
-#SBATCH --time=1-00:00:00
-#SBATCH --job-name=pcoa
-#SBATCH --output=slurm-%x-%j.out
-
-set -euo pipefail
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate qiime2-amplicon-2024.10
-cd /path/to/PCOA-prototype
-
-python src/run_pipeline.py \
-  --study PRJEB44533=data/fastq_data/PRJEB44533/subsample_10 \
-  --metadata data/PRJEB44533/metadata.csv \
-  --color-by description \
-  --run-dir "runs/prjeb44533/sub10-${SLURM_JOB_ID}" \
-  --trim-length 120 \
-  --min-reads 0 \
-  --threads "${SLURM_CPUS_PER_TASK}"
-```
-
-Adjust the partition, environment name, memory, and wall time for the server.
+The versioned wrappers under `scripts/slurm/` cover the CRC, MMC20, and MMC1
+analysis runs. They remain plain Bash files that can be copied to the server
+with `scp` and submitted from the repository root. See
+`scripts/slurm/README.md` for the script inventory, copy commands, submission
+examples, environment overrides, and monitoring commands.
 
 ---
 
