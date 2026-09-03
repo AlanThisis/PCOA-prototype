@@ -29,6 +29,10 @@ then commit and push them before executing data-heavy runs on the lab server.
 SLURM files are thin, project-specific resource wrappers and should remain
 local unless the user explicitly requests one be versioned. Downloads and
 subsampling remain separate preparation steps rather than orchestrator stages.
+When preparing or submitting SLURM work, create a run-specific log directory
+up front and direct job stdout and stderr into it. Do not leave `slurm-*.out`
+or related scheduler logs at the repository root; group them under the
+corresponding `runs/<workflow>/logs/` directory, preferably by job or job array.
 
 ## Slides & Presentation Artifacts
 
