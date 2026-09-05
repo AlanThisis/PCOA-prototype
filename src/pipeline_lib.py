@@ -6,6 +6,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -48,6 +49,7 @@ class TimingRecorder:
     def __init__(self, path: Path | None, component: str) -> None:
         self.path = path.resolve() if path is not None else None
         self.component = component
+        self._write_lock = threading.Lock()
         if self.path is not None:
             self._initialize_file()
 
@@ -151,14 +153,15 @@ class TimingRecorder:
     def _append(self, record: TimingRecord) -> None:
         if self.path is None:
             return
-        with self.path.open("a", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(
-                handle,
-                fieldnames=TIMING_COLUMNS,
-                delimiter="\t",
-                lineterminator="\n",
-            )
-            writer.writerow(asdict(record))
+        with self._write_lock:
+            with self.path.open("a", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=TIMING_COLUMNS,
+                    delimiter="\t",
+                    lineterminator="\n",
+                )
+                writer.writerow(asdict(record))
 
 
 def add_timing_argument(parser: argparse.ArgumentParser) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -79,3 +80,22 @@ def test_timed_main_records_nonzero_return_as_failed(tmp_path: Path) -> None:
     assert row["step"] == "total"
     assert row["status"] == "failed"
     assert row["exit_code"] == "3"
+
+
+def test_timing_recorder_writes_valid_rows_from_concurrent_steps(tmp_path: Path) -> None:
+    timings_path = tmp_path / "timings.tsv"
+    timing = TimingRecorder(timings_path, component="concurrent-test")
+
+    def record_step(index: int) -> None:
+        with timing.step("operation", item=str(index)):
+            pass
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(record_step, range(40)))
+
+    rows = read_timing_rows(timings_path)
+    assert len(rows) == 80
+    assert {row["item"] for row in rows} == {str(index) for index in range(40)}
+    assert all(row.get(None) is None for row in rows)
+    assert [row["status"] for row in rows].count("running") == 40
+    assert [row["status"] for row in rows].count("completed") == 40

@@ -148,10 +148,15 @@ python src/subsample_fastq.py \
   --output-dir data/fastq_data/PRJEB44533/subsample_10 \
   --percent 10 \
   --seed 11 \
+  --workers 4 \
   --timings-tsv data/fastq_data/PRJEB44533/subsample_10_timings.tsv
 ```
 
-`subsample_fastq.py` uses `seqkit sample2` with two-pass mode (`-2`) for stable fraction sampling. Run it again with `--percent 25` / `--percent 50` for additional subsampling levels.
+`subsample_fastq.py` uses `seqkit sample2` with two-pass mode (`-2`) for
+stable fraction sampling. `--workers` processes independent FASTQ files in
+parallel; set it to the number of CPUs allocated to the process. Its default is
+`1`, preserving the original serial behavior. Run the command again with
+`--percent 25` / `--percent 50` for additional subsampling levels.
 
 ### 4. Run the Prepared FASTQs
 

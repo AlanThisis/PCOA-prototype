@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 import subsample_fastq
-from subsample_fastq import subsample_fastqs, validate_percent
+from subsample_fastq import subsample_fastqs, validate_percent, validate_workers
 
 
 def test_validate_percent_accepts_expected_range() -> None:
@@ -18,6 +20,12 @@ def test_validate_percent_accepts_expected_range() -> None:
 def test_validate_percent_rejects_invalid_values(bad_percent: float) -> None:
     with pytest.raises(ValueError, match=r"\(0, 100\]"):
         validate_percent(bad_percent)
+
+
+@pytest.mark.parametrize("bad_workers", [0, -1, -10])
+def test_validate_workers_rejects_nonpositive_values(bad_workers: int) -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        validate_workers(bad_workers)
 
 
 def test_subsample_fastqs_discovers_forward_reads_only_and_builds_sample2_commands(
@@ -123,3 +131,65 @@ def test_subsample_fastqs_excludes_existing_output_files_under_input_tree(
     assert sampled_paths == [output_dir / "ERR100_1.fastq.gz"]
     assert len(commands) == 1
     assert commands[0][7] == str(source_fastq.resolve())
+
+
+def test_subsample_fastqs_runs_multiple_seqkit_processes_concurrently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    for index in range(4):
+        (input_dir / f"SRR{index}_1.fastq.gz").write_bytes(b"non-empty")
+    output_dir = tmp_path / "out"
+    commands: list[list[str]] = []
+    active = 0
+    maximum_active = 0
+    lock = threading.Lock()
+
+    def fake_run_command(args: list[str], **_: object) -> None:
+        nonlocal active, maximum_active
+        with lock:
+            commands.append(args)
+            active += 1
+            maximum_active = max(maximum_active, active)
+        time.sleep(0.02)
+        with lock:
+            active -= 1
+
+    monkeypatch.setattr(subsample_fastq, "resolve_executable", lambda _: "/env/bin/seqkit")
+    monkeypatch.setattr(subsample_fastq, "run_command", fake_run_command)
+
+    sampled_paths = subsample_fastqs(
+        input_dir, output_dir, percent=10, seed=11, workers=2
+    )
+
+    assert maximum_active == 2
+    assert len(commands) == 4
+    assert all(command[1:3] == ["--threads", "1"] for command in commands)
+    assert [path.name for path in sampled_paths] == [
+        "SRR0_1.fastq.gz",
+        "SRR1_1.fastq.gz",
+        "SRR2_1.fastq.gz",
+        "SRR3_1.fastq.gz",
+    ]
+
+
+def test_subsample_fastqs_propagates_parallel_worker_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    (input_dir / "ERR100_1.fastq.gz").write_bytes(b"non-empty")
+    (input_dir / "ERR101_1.fastq.gz").write_bytes(b"non-empty")
+
+    def fake_run_command(args: list[str], **_: object) -> None:
+        if "ERR100_1.fastq.gz" in " ".join(args):
+            raise RuntimeError("seqkit failed")
+
+    monkeypatch.setattr(subsample_fastq, "resolve_executable", lambda _: "/env/bin/seqkit")
+    monkeypatch.setattr(subsample_fastq, "run_command", fake_run_command)
+
+    with pytest.raises(RuntimeError, match="seqkit failed"):
+        subsample_fastqs(
+            input_dir, tmp_path / "out", percent=50, seed=11, workers=2
+        )
