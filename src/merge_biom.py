@@ -23,6 +23,11 @@ def parse_args() -> argparse.Namespace:
                         help="Deblur workflow output dirs (each must have all.biom and all.seqs.fa).")
     parser.add_argument("--out-dir", type=Path, required=True,
                         help="Output directory for merged all.biom and all.seqs.fa.")
+    parser.add_argument(
+        "--skip-empty",
+        action="store_true",
+        help="Skip valid Deblur outputs containing zero samples and zero features.",
+    )
     add_timing_argument(parser)
     return parser.parse_args()
 
@@ -60,9 +65,22 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
         with timing.step("load_deblur_output", item=str(d)):
             t = biom.load_table(str(biom_fp))
             loaded_seqs = load_seqs(fa_fp)
+        if t.shape == (0, 0) and not loaded_seqs:
+            if not args.skip_empty:
+                raise ValueError(f"Empty Deblur output: {d}")
+            print(f"  {d.name}: excluded empty Deblur output")
+            timing.skipped(
+                "load_deblur_output",
+                item=str(d),
+                message="zero samples and zero features",
+            )
+            continue
         print(f"  {d.name}: {t.shape[1]} samples, {t.shape[0]} features")
         tables.append(t)
         all_seqs.update(loaded_seqs)
+
+    if not tables:
+        raise ValueError("No non-empty Deblur outputs are available to merge")
 
     with timing.step("merge_feature_tables", item=f"{len(tables)} tables"):
         merged = tables[0]

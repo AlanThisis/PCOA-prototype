@@ -37,6 +37,7 @@ def install_fake_environment(
     commands: list[list[str]],
     *,
     fail_script: str | None = None,
+    empty_study: str | None = None,
 ) -> None:
     monkeypatch.setattr(
         run_pipeline,
@@ -55,7 +56,8 @@ def install_fake_environment(
             output_dir = command_value(command, "--work-dir") / "workflow"
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "all.biom").write_bytes(b"biom")
-            (output_dir / "all.seqs.fa").write_bytes(b"fasta")
+            is_empty = command_value(command, "--data-dir").name == empty_study
+            (output_dir / "all.seqs.fa").write_bytes(b"" if is_empty else b"fasta")
         elif script == "merge_biom.py":
             output_dir = command_value(command, "--out-dir")
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -192,6 +194,31 @@ def test_cross_study_run_merges_and_generates_metadata_plots(
     assert "--refresh-input-artifacts" in commands[3]
     assert (run_dir / "results" / "pcoa_disease_status.png").is_file()
     assert (run_dir / "results" / "pcoa_study.png").is_file()
+
+
+def test_cross_study_run_excludes_zero_feature_deblur_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    empty = tmp_path / "empty-study"
+    retained = tmp_path / "retained-study"
+    write_fastq(empty, "ERR0")
+    write_fastq(retained, "ERR1")
+    commands: list[list[str]] = []
+    install_fake_environment(monkeypatch, commands, empty_study=empty.name)
+
+    run_dir = run_pipeline.execute_pipeline(
+        make_args(tmp_path, [("empty", empty), ("retained", retained)])
+    )
+
+    state = json.loads((run_dir / "run_state.json").read_text())
+    assert state["stages"]["deblur:empty"]["status"] == "excluded_empty"
+    assert state["stages"]["deblur:retained"]["status"] == "completed"
+    merge_command = next(
+        command for command in commands if Path(command[1]).name == "merge_biom.py"
+    )
+    assert "--skip-empty" in merge_command
+    assert state["stages"]["merge"]["status"] == "completed"
+    assert state["stages"]["unifrac"]["status"] == "completed"
 
 
 def test_cross_study_deblur_runs_concurrently_with_bounded_inner_jobs(

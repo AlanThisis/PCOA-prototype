@@ -457,6 +457,7 @@ def build_stages(
             *(str(path) for path in deblur_workflows),
             "--out-dir",
             str(merged_dir),
+            "--skip-empty",
             "--timings-tsv",
             str(attempt_dir / "merge.tsv"),
         ]
@@ -629,6 +630,25 @@ def run_stage(
         )
         missing = [path for path in stage.expected_outputs if not outputs_exist((path,))]
         if missing:
+            if is_empty_deblur_output(stage):
+                message = "Deblur produced a zero-feature table; excluding study downstream"
+                with state_lock:
+                    stage_state = state["stages"][stage.name]
+                    stage_state.update(
+                        {
+                            "status": "excluded_empty",
+                            "ended_utc": utc_now(),
+                            "error": message,
+                        }
+                    )
+                    write_json_atomic(state_path, state)
+                print(f"Excluded empty stage: {stage.name}", flush=True)
+                timing.skipped(
+                    stage.name,
+                    item=str(stage.expected_outputs[0]),
+                    message=message,
+                )
+                return
             raise RuntimeError(
                 f"Stage {stage.name} completed without expected non-empty output(s): "
                 + ", ".join(str(path) for path in missing)
@@ -657,10 +677,24 @@ def should_skip_stage(
     stage: Stage, state: dict[str, Any], rerun_stages: set[str]
 ) -> bool:
     stage_state = state["stages"][stage.name]
+    if stage_state.get("status") == "excluded_empty":
+        return is_empty_deblur_output(stage)
     return (
         stage_state.get("status") == "completed"
         and outputs_exist(stage.expected_outputs)
         and not rerun_stages.intersection(stage.dependencies)
+    )
+
+
+def is_empty_deblur_output(stage: Stage) -> bool:
+    if not stage.name.startswith("deblur:") or len(stage.expected_outputs) != 2:
+        return False
+    biom_path, fasta_path = stage.expected_outputs
+    return (
+        biom_path.is_file()
+        and biom_path.stat().st_size > 0
+        and fasta_path.is_file()
+        and fasta_path.stat().st_size == 0
     )
 
 
