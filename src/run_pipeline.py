@@ -10,6 +10,8 @@ import re
 import socket
 import subprocess
 import sys
+import threading
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -82,6 +84,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--gg2-dir", type=Path, default=Path("data/gg2"))
     parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument(
+        "--deblur-study-workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of independent study-level Deblur workflows to run concurrently "
+            "(default: 1)."
+        ),
+    )
+    parser.add_argument(
+        "--deblur-jobs-per-study",
+        type=int,
+        default=None,
+        help=(
+            "Deblur sample jobs allowed within each concurrent study. By default, "
+            "divide --threads across the active study workers."
+        ),
+    )
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -195,10 +215,15 @@ def validate_args(args: argparse.Namespace) -> tuple[list[Study], Path | None, d
         raise ValueError("--sampling-depth must be greater than zero")
     if args.threads <= 0:
         raise ValueError("--threads must be greater than zero")
+    if args.deblur_study_workers <= 0:
+        raise ValueError("--deblur-study-workers must be greater than zero")
+    if args.deblur_jobs_per_study is not None and args.deblur_jobs_per_study <= 0:
+        raise ValueError("--deblur-jobs-per-study must be greater than zero")
     if not args.error_dist.strip():
         raise ValueError("--error-dist cannot be empty")
 
     studies = parse_studies(args.study)
+    resolve_deblur_parallelism(args, len(studies))
     metadata = validate_metadata(args.metadata, args.color_by)
     gg2_dir = args.gg2_dir.expanduser().resolve()
     missing_gg2 = [
@@ -222,6 +247,25 @@ def validate_args(args: argparse.Namespace) -> tuple[list[Study], Path | None, d
     args.run_dir = args.run_dir.expanduser().resolve()
     args.gg2_dir = gg2_dir
     return studies, metadata, executables
+
+
+def resolve_deblur_parallelism(
+    args: argparse.Namespace, study_count: int
+) -> tuple[int, int]:
+    if study_count <= 0:
+        raise ValueError("At least one study is required")
+    study_workers = min(args.deblur_study_workers, study_count)
+    jobs_per_study = args.deblur_jobs_per_study
+    if jobs_per_study is None:
+        jobs_per_study = max(1, args.threads // study_workers)
+    requested_jobs = study_workers * jobs_per_study
+    if requested_jobs > args.threads:
+        raise ValueError(
+            "Deblur parallelism oversubscribes --threads: "
+            f"{study_workers} active studies x {jobs_per_study} jobs per study = "
+            f"{requested_jobs}, but --threads={args.threads}"
+        )
+    return study_workers, jobs_per_study
 
 
 def validate_qiime_gg2(qiime: str) -> None:
@@ -370,6 +414,7 @@ def build_stages(
     output_paths = stage_output_paths(run_dir, studies, args.color_by)
     stages: list[Stage] = []
     deblur_workflows: list[Path] = []
+    _, deblur_jobs_per_study = resolve_deblur_parallelism(args, len(studies))
 
     for study in studies:
         deblur_dir = run_dir / "work" / "deblur" / study.name
@@ -389,7 +434,7 @@ def build_stages(
             "--min-reads",
             str(args.min_reads),
             "--jobs-to-start",
-            str(args.threads),
+            str(deblur_jobs_per_study),
             "--timings-tsv",
             str(attempt_dir / f"deblur-{study.name}.tsv"),
         ]
@@ -560,18 +605,21 @@ def run_stage(
     state_path: Path,
     attempt_number: int,
     timing: TimingRecorder,
+    state_lock: threading.Lock | None = None,
 ) -> None:
-    stage_state = state["stages"][stage.name]
-    stage_state.update(
-        {
-            "status": "running",
-            "attempt": attempt_number,
-            "started_utc": utc_now(),
-            "ended_utc": None,
-            "error": None,
-        }
-    )
-    write_json_atomic(state_path, state)
+    state_lock = state_lock or threading.Lock()
+    with state_lock:
+        stage_state = state["stages"][stage.name]
+        stage_state.update(
+            {
+                "status": "running",
+                "attempt": attempt_number,
+                "started_utc": utc_now(),
+                "ended_utc": None,
+                "error": None,
+            }
+        )
+        write_json_atomic(state_path, state)
     try:
         run_command(
             list(stage.command),
@@ -586,17 +634,105 @@ def run_stage(
                 + ", ".join(str(path) for path in missing)
             )
     except BaseException as exc:
+        with state_lock:
+            stage_state = state["stages"][stage.name]
+            stage_state.update(
+                {
+                    "status": "failed",
+                    "ended_utc": utc_now(),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            write_json_atomic(state_path, state)
+        raise
+    with state_lock:
+        stage_state = state["stages"][stage.name]
         stage_state.update(
-            {
-                "status": "failed",
-                "ended_utc": utc_now(),
-                "error": f"{type(exc).__name__}: {exc}",
-            }
+            {"status": "completed", "ended_utc": utc_now(), "error": None}
         )
         write_json_atomic(state_path, state)
-        raise
-    stage_state.update({"status": "completed", "ended_utc": utc_now(), "error": None})
-    write_json_atomic(state_path, state)
+
+
+def should_skip_stage(
+    stage: Stage, state: dict[str, Any], rerun_stages: set[str]
+) -> bool:
+    stage_state = state["stages"][stage.name]
+    return (
+        stage_state.get("status") == "completed"
+        and outputs_exist(stage.expected_outputs)
+        and not rerun_stages.intersection(stage.dependencies)
+    )
+
+
+def record_skipped_stage(stage: Stage, timing: TimingRecorder) -> None:
+    print(f"Skipping completed stage: {stage.name}", flush=True)
+    timing.skipped(
+        stage.name,
+        item=", ".join(str(path) for path in stage.expected_outputs),
+        message="state completed and expected outputs exist",
+    )
+
+
+def run_deblur_stages(
+    stages: list[Stage],
+    state: dict[str, Any],
+    state_path: Path,
+    attempt_number: int,
+    timing: TimingRecorder,
+    study_workers: int,
+) -> set[str]:
+    rerun_stages: set[str] = set()
+    stages_to_run: list[Stage] = []
+    for stage in stages:
+        if should_skip_stage(stage, state, rerun_stages):
+            record_skipped_stage(stage, timing)
+        else:
+            stages_to_run.append(stage)
+
+    if not stages_to_run:
+        return rerun_stages
+
+    if study_workers == 1:
+        for stage in stages_to_run:
+            print(f"Running stage: {stage.name}", flush=True)
+            run_stage(stage, state, state_path, attempt_number, timing)
+            rerun_stages.add(stage.name)
+        return rerun_stages
+
+    state_lock = threading.Lock()
+    first_error: BaseException | None = None
+    futures: dict[Future[None], Stage] = {}
+    with ThreadPoolExecutor(max_workers=min(study_workers, len(stages_to_run))) as executor:
+        for stage in stages_to_run:
+            print(f"Submitting concurrent stage: {stage.name}", flush=True)
+            future = executor.submit(
+                run_stage,
+                stage,
+                state,
+                state_path,
+                attempt_number,
+                timing,
+                state_lock,
+            )
+            futures[future] = stage
+        for future in as_completed(futures):
+            stage = futures[future]
+            try:
+                future.result()
+            except CancelledError:
+                continue
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+                    for pending in futures:
+                        if pending is not future:
+                            pending.cancel()
+            else:
+                rerun_stages.add(stage.name)
+                print(f"Completed concurrent stage: {stage.name}", flush=True)
+    if first_error is not None:
+        raise first_error
+    return rerun_stages
 
 
 def execute_pipeline(args: argparse.Namespace) -> Path:
@@ -614,12 +750,17 @@ def execute_pipeline(args: argparse.Namespace) -> Path:
     stages = build_stages(args, studies, metadata, attempt_dir, repo_dir)
     state_path = args.run_dir / "run_state.json"
     current_commit, tracked_dirty = git_info(repo_dir)
+    deblur_study_workers, deblur_jobs_per_study = resolve_deblur_parallelism(
+        args, len(studies)
+    )
     attempt = {
         "number": attempt_number,
         "status": "running",
         "started_utc": utc_now(),
         "ended_utc": None,
         "threads": args.threads,
+        "deblur_study_workers": deblur_study_workers,
+        "deblur_jobs_per_study": deblur_jobs_per_study,
         "git_commit": current_commit,
         "git_tracked_dirty": tracked_dirty,
         "hostname": socket.gethostname(),
@@ -634,20 +775,25 @@ def execute_pipeline(args: argparse.Namespace) -> Path:
     rerun_stages: set[str] = set()
     try:
         with timing.step("total", item=str(args.run_dir)):
-            for stage in stages:
-                stage_state = state["stages"][stage.name]
-                can_skip = (
-                    stage_state.get("status") == "completed"
-                    and outputs_exist(stage.expected_outputs)
-                    and not rerun_stages.intersection(stage.dependencies)
+            deblur_stages = [
+                stage for stage in stages if stage.name.startswith("deblur:")
+            ]
+            downstream_stages = [
+                stage for stage in stages if not stage.name.startswith("deblur:")
+            ]
+            rerun_stages.update(
+                run_deblur_stages(
+                    deblur_stages,
+                    state,
+                    state_path,
+                    attempt_number,
+                    timing,
+                    deblur_study_workers,
                 )
-                if can_skip:
-                    print(f"Skipping completed stage: {stage.name}", flush=True)
-                    timing.skipped(
-                        stage.name,
-                        item=", ".join(str(path) for path in stage.expected_outputs),
-                        message="state completed and expected outputs exist",
-                    )
+            )
+            for stage in downstream_stages:
+                if should_skip_stage(stage, state, rerun_stages):
+                    record_skipped_stage(stage, timing)
                     continue
 
                 print(f"Running stage: {stage.name}", flush=True)

@@ -223,6 +223,22 @@ Study names and sample identifiers must be unique. For a single study, the
 merge stage is skipped and that study's Deblur workflow is passed directly to
 UniFrac.
 
+Deblur can also process independent studies concurrently while keeping its
+total sample-job concurrency within the allocated CPU count. For example, a
+32-CPU allocation can run eight studies with four Deblur jobs per study:
+
+```bash
+python src/run_pipeline.py \
+  ... \
+  --threads 32 \
+  --deblur-study-workers 8 \
+  --deblur-jobs-per-study 4
+```
+
+The default remains one study at a time. If `--deblur-jobs-per-study` is
+omitted, the pipeline divides `--threads` across the active study workers and
+rejects configurations that would oversubscribe the allocation.
+
 `unifrac.py` uses GG2's `non-v4-16s` closed-reference action (vsearch at 99%) to map Deblur ASVs onto the GG2 backbone, then computes UniFrac against the GG2 ID phylogeny. Rarefaction depth defaults to 1,000 reads after backbone mapping; override with `--sampling-depth`.
 
 ### Resume a Failed Run

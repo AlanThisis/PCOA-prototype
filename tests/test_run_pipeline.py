@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -190,6 +192,146 @@ def test_cross_study_run_merges_and_generates_metadata_plots(
     assert "--refresh-input-artifacts" in commands[3]
     assert (run_dir / "results" / "pcoa_disease_status.png").is_file()
     assert (run_dir / "results" / "pcoa_study.png").is_file()
+
+
+def test_cross_study_deblur_runs_concurrently_with_bounded_inner_jobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    studies = []
+    for index in range(4):
+        study_dir = tmp_path / f"study-{index}"
+        write_fastq(study_dir, f"ERR{index}")
+        studies.append((f"study-{index}", study_dir))
+
+    commands: list[list[str]] = []
+    install_fake_environment(monkeypatch, commands)
+    active = 0
+    maximum_active = 0
+    lock = threading.Lock()
+    original_run_command = run_pipeline.run_command
+
+    def delayed_run_command(command: list[str], **kwargs: object) -> None:
+        nonlocal active, maximum_active
+        if Path(command[1]).name == "run_deblur.py":
+            with lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            time.sleep(0.03)
+            try:
+                original_run_command(command, **kwargs)
+            finally:
+                with lock:
+                    active -= 1
+        else:
+            original_run_command(command, **kwargs)
+
+    monkeypatch.setattr(run_pipeline, "run_command", delayed_run_command)
+    args = make_args(
+        tmp_path,
+        studies,
+        extra=[
+            "--deblur-study-workers",
+            "2",
+            "--deblur-jobs-per-study",
+            "3",
+        ],
+    )
+
+    run_dir = run_pipeline.execute_pipeline(args)
+
+    assert maximum_active == 2
+    deblur_commands = [
+        command for command in commands if Path(command[1]).name == "run_deblur.py"
+    ]
+    assert len(deblur_commands) == 4
+    assert all(
+        command[command.index("--jobs-to-start") + 1] == "3"
+        for command in deblur_commands
+    )
+    state = json.loads((run_dir / "run_state.json").read_text())
+    assert all(stage["status"] == "completed" for stage in state["stages"].values())
+    assert state["attempts"][0]["deblur_study_workers"] == 2
+    assert state["attempts"][0]["deblur_jobs_per_study"] == 3
+
+
+def test_deblur_parallelism_auto_divides_threads_across_effective_workers() -> None:
+    class Args:
+        threads = 16
+        deblur_study_workers = 8
+        deblur_jobs_per_study = None
+
+    assert run_pipeline.resolve_deblur_parallelism(Args(), 2) == (2, 8)
+
+
+def test_deblur_parallelism_rejects_oversubscription() -> None:
+    class Args:
+        threads = 16
+        deblur_study_workers = 8
+        deblur_jobs_per_study = 4
+
+    with pytest.raises(ValueError, match="oversubscribes"):
+        run_pipeline.resolve_deblur_parallelism(Args(), 8)
+
+
+def test_concurrent_deblur_failure_leaves_resumable_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    studies = []
+    for index in range(3):
+        study_dir = tmp_path / f"study-{index}"
+        write_fastq(study_dir, f"ERR{index}")
+        studies.append((f"study-{index}", study_dir))
+    run_dir = tmp_path / "run"
+    commands: list[list[str]] = []
+    install_fake_environment(monkeypatch, commands)
+    original_run_command = run_pipeline.run_command
+
+    def fail_one_study(command: list[str], **kwargs: object) -> None:
+        if Path(command[1]).name == "run_deblur.py":
+            data_dir = command_value(command, "--data-dir")
+            if data_dir.name == "study-0":
+                time.sleep(0.01)
+                raise RuntimeError("injected concurrent Deblur failure")
+            time.sleep(0.05)
+        original_run_command(command, **kwargs)
+
+    monkeypatch.setattr(run_pipeline, "run_command", fail_one_study)
+    args = make_args(
+        tmp_path,
+        studies,
+        run_dir=run_dir,
+        extra=["--deblur-study-workers", "2"],
+    )
+
+    with pytest.raises(RuntimeError, match="concurrent Deblur failure"):
+        run_pipeline.execute_pipeline(args)
+
+    state = json.loads((run_dir / "run_state.json").read_text())
+    deblur_statuses = {
+        name: stage["status"]
+        for name, stage in state["stages"].items()
+        if name.startswith("deblur:")
+    }
+    assert deblur_statuses["deblur:study-0"] == "failed"
+    assert "running" not in deblur_statuses.values()
+    assert state["attempts"][0]["status"] == "failed"
+
+    resumed_commands: list[list[str]] = []
+    install_fake_environment(monkeypatch, resumed_commands)
+    resume_args = make_args(
+        tmp_path,
+        studies,
+        run_dir=run_dir,
+        extra=["--resume", "--deblur-study-workers", "2"],
+    )
+    run_pipeline.execute_pipeline(resume_args)
+
+    resumed_state = json.loads((run_dir / "run_state.json").read_text())
+    assert all(
+        stage["status"] == "completed"
+        for stage in resumed_state["stages"].values()
+    )
+    assert resumed_state["attempts"][1]["status"] == "completed"
 
 
 def test_failed_stage_is_persisted_and_can_be_resumed(
