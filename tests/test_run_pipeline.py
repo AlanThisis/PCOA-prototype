@@ -485,6 +485,35 @@ def test_resume_rejects_manifest_mismatch(
         run_pipeline.execute_pipeline(mismatch)
 
 
+def test_resume_allows_new_code_commit_and_records_attempt_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    study_dir = tmp_path / "study"
+    write_fastq(study_dir, "ERR1")
+    run_dir = tmp_path / "run"
+    commands: list[list[str]] = []
+    install_fake_environment(monkeypatch, commands)
+    run_pipeline.execute_pipeline(
+        make_args(tmp_path, [("ERP", study_dir)], run_dir=run_dir)
+    )
+
+    resumed_commands: list[list[str]] = []
+    install_fake_environment(monkeypatch, resumed_commands)
+    monkeypatch.setattr(run_pipeline, "git_info", lambda _: ("def456", False))
+    run_pipeline.execute_pipeline(
+        make_args(
+            tmp_path,
+            [("ERP", study_dir)],
+            run_dir=run_dir,
+            extra=["--resume"],
+        )
+    )
+
+    state = json.loads((run_dir / "run_state.json").read_text())
+    assert resumed_commands == []
+    assert state["attempts"][1]["git_commit"] == "def456"
+
+
 def test_nonempty_run_requires_explicit_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

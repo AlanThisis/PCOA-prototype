@@ -351,7 +351,6 @@ def build_manifest(
 
 def compatibility_view(manifest: dict[str, Any]) -> dict[str, Any]:
     keys = (
-        "git_commit",
         "studies",
         "metadata",
         "color_by",
