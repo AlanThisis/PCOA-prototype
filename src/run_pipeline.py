@@ -103,6 +103,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--max-failed-studies",
+        type=int,
+        default=0,
+        help=(
+            "Maximum number of persistently failed Deblur studies that may be "
+            "excluded before merge (default: 0). Exclusions are recorded."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Resume a compatible existing run; completed stages are validated before skipping.",
@@ -219,6 +228,8 @@ def validate_args(args: argparse.Namespace) -> tuple[list[Study], Path | None, d
         raise ValueError("--deblur-study-workers must be greater than zero")
     if args.deblur_jobs_per_study is not None and args.deblur_jobs_per_study <= 0:
         raise ValueError("--deblur-jobs-per-study must be greater than zero")
+    if args.max_failed_studies < 0:
+        raise ValueError("--max-failed-studies cannot be negative")
     if not args.error_dist.strip():
         raise ValueError("--error-dist cannot be empty")
 
@@ -457,6 +468,8 @@ def build_stages(
             "--out-dir",
             str(merged_dir),
             "--skip-empty",
+            "--run-state",
+            str(run_dir / "run_state.json"),
             "--timings-tsv",
             str(attempt_dir / "merge.tsv"),
         ]
@@ -713,8 +726,9 @@ def run_deblur_stages(
     attempt_number: int,
     timing: TimingRecorder,
     study_workers: int,
-) -> set[str]:
+) -> tuple[set[str], set[str]]:
     rerun_stages: set[str] = set()
+    failed_stages: set[str] = set()
     stages_to_run: list[Stage] = []
     for stage in stages:
         if should_skip_stage(stage, state, rerun_stages):
@@ -723,17 +737,21 @@ def run_deblur_stages(
             stages_to_run.append(stage)
 
     if not stages_to_run:
-        return rerun_stages
+        return rerun_stages, failed_stages
 
     if study_workers == 1:
         for stage in stages_to_run:
             print(f"Running stage: {stage.name}", flush=True)
-            run_stage(stage, state, state_path, attempt_number, timing)
-            rerun_stages.add(stage.name)
-        return rerun_stages
+            try:
+                run_stage(stage, state, state_path, attempt_number, timing)
+            except BaseException as exc:
+                failed_stages.add(stage.name)
+                print(f"Failed independent stage: {stage.name}: {exc}", flush=True)
+            else:
+                rerun_stages.add(stage.name)
+        return rerun_stages, failed_stages
 
     state_lock = threading.Lock()
-    first_error: BaseException | None = None
     futures: dict[Future[None], Stage] = {}
     with ThreadPoolExecutor(max_workers=min(study_workers, len(stages_to_run))) as executor:
         for stage in stages_to_run:
@@ -755,17 +773,33 @@ def run_deblur_stages(
             except CancelledError:
                 continue
             except BaseException as exc:
-                if first_error is None:
-                    first_error = exc
-                    for pending in futures:
-                        if pending is not future:
-                            pending.cancel()
+                failed_stages.add(stage.name)
+                print(f"Failed independent stage: {stage.name}: {exc}", flush=True)
             else:
                 rerun_stages.add(stage.name)
                 print(f"Completed concurrent stage: {stage.name}", flush=True)
-    if first_error is not None:
-        raise first_error
-    return rerun_stages
+    return rerun_stages, failed_stages
+
+
+def write_study_processing_status(
+    run_dir: Path, studies: list[Study], state: dict[str, Any]
+) -> Path:
+    path = run_dir / "results" / "study_processing_status.tsv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(("study", "status", "attempt", "message"))
+        for study in studies:
+            stage = state["stages"][f"deblur:{study.name}"]
+            writer.writerow(
+                (
+                    study.name,
+                    stage.get("status", "pending"),
+                    stage.get("attempt") or "",
+                    stage.get("error") or "",
+                )
+            )
+    return path
 
 
 def execute_pipeline(args: argparse.Namespace) -> Path:
@@ -794,6 +828,7 @@ def execute_pipeline(args: argparse.Namespace) -> Path:
         "threads": args.threads,
         "deblur_study_workers": deblur_study_workers,
         "deblur_jobs_per_study": deblur_jobs_per_study,
+        "max_failed_studies": args.max_failed_studies,
         "git_commit": current_commit,
         "git_tracked_dirty": tracked_dirty,
         "hostname": socket.gethostname(),
@@ -814,16 +849,29 @@ def execute_pipeline(args: argparse.Namespace) -> Path:
             downstream_stages = [
                 stage for stage in stages if not stage.name.startswith("deblur:")
             ]
-            rerun_stages.update(
-                run_deblur_stages(
-                    deblur_stages,
-                    state,
-                    state_path,
-                    attempt_number,
-                    timing,
-                    deblur_study_workers,
-                )
+            rerun_deblur, failed_deblur = run_deblur_stages(
+                deblur_stages,
+                state,
+                state_path,
+                attempt_number,
+                timing,
+                deblur_study_workers,
             )
+            rerun_stages.update(rerun_deblur)
+            status_path = write_study_processing_status(args.run_dir, studies, state)
+            print(f"Study processing status: {status_path}", flush=True)
+            if len(failed_deblur) > args.max_failed_studies:
+                names = ", ".join(sorted(failed_deblur))
+                raise RuntimeError(
+                    f"{len(failed_deblur)} Deblur study stage(s) failed, exceeding "
+                    f"--max-failed-studies={args.max_failed_studies}: {names}"
+                )
+            if failed_deblur:
+                print(
+                    f"Excluding {len(failed_deblur)} failed Deblur study stage(s) "
+                    f"within configured limit: {', '.join(sorted(failed_deblur))}",
+                    flush=True,
+                )
             for stage in downstream_stages:
                 if should_skip_stage(stage, state, rerun_stages):
                     record_skipped_stage(stage, timing)

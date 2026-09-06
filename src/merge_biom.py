@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import biom
@@ -27,6 +28,11 @@ def parse_args() -> argparse.Namespace:
         "--skip-empty",
         action="store_true",
         help="Skip valid Deblur outputs containing zero samples and zero features.",
+    )
+    parser.add_argument(
+        "--run-state",
+        type=Path,
+        help="Pipeline run_state.json used to exclude non-completed Deblur studies.",
     )
     add_timing_argument(parser)
     return parser.parse_args()
@@ -53,9 +59,23 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
 
     tables = []
     all_seqs: dict[str, str] = {}
+    stage_states = None
+    if args.run_state is not None:
+        with args.run_state.open(encoding="utf-8") as handle:
+            stage_states = json.load(handle).get("stages", {})
 
     for d in args.deblur_dirs:
         d = d.resolve()
+        if stage_states is not None:
+            stage_status = stage_states.get(f"deblur:{d.parent.name}", {}).get("status")
+            if stage_status != "completed":
+                print(f"  {d.parent.name}: excluded with stage status {stage_status}")
+                timing.skipped(
+                    "load_deblur_output",
+                    item=str(d),
+                    message=f"stage status {stage_status}",
+                )
+                continue
         biom_fp = d / "all.biom"
         fa_fp = d / "all.seqs.fa"
         if not biom_fp.exists():

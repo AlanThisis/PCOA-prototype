@@ -330,7 +330,7 @@ def test_concurrent_deblur_failure_leaves_resumable_state(
         extra=["--deblur-study-workers", "2"],
     )
 
-    with pytest.raises(RuntimeError, match="concurrent Deblur failure"):
+    with pytest.raises(RuntimeError, match="1 Deblur study stage.*study-0"):
         run_pipeline.execute_pipeline(args)
 
     state = json.loads((run_dir / "run_state.json").read_text())
@@ -340,6 +340,8 @@ def test_concurrent_deblur_failure_leaves_resumable_state(
         if name.startswith("deblur:")
     }
     assert deblur_statuses["deblur:study-0"] == "failed"
+    assert deblur_statuses["deblur:study-1"] == "completed"
+    assert deblur_statuses["deblur:study-2"] == "completed"
     assert "running" not in deblur_statuses.values()
     assert state["attempts"][0]["status"] == "failed"
 
@@ -395,6 +397,48 @@ def test_failed_stage_is_persisted_and_can_be_resumed(
     assert state["attempts"][1]["status"] == "completed"
     assert state["attempts"][1]["threads"] == 2
     assert (run_dir / "timings" / "attempt-002" / "pipeline.tsv").is_file()
+
+
+def test_configured_failed_study_limit_allows_downstream_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "failed-study"
+    second = tmp_path / "retained-study"
+    write_fastq(first, "ERR0")
+    write_fastq(second, "ERR1")
+    commands: list[list[str]] = []
+    install_fake_environment(monkeypatch, commands)
+    original_run_command = run_pipeline.run_command
+
+    def fail_one_study(command: list[str], **kwargs: object) -> None:
+        if (
+            Path(command[1]).name == "run_deblur.py"
+            and command_value(command, "--data-dir").name == first.name
+        ):
+            raise RuntimeError("persistent study failure")
+        original_run_command(command, **kwargs)
+
+    monkeypatch.setattr(run_pipeline, "run_command", fail_one_study)
+    run_dir = run_pipeline.execute_pipeline(
+        make_args(
+            tmp_path,
+            [("failed", first), ("retained", second)],
+            extra=["--deblur-study-workers", "2", "--max-failed-studies", "1"],
+        )
+    )
+
+    state = json.loads((run_dir / "run_state.json").read_text())
+    assert state["stages"]["deblur:failed"]["status"] == "failed"
+    assert state["stages"]["deblur:retained"]["status"] == "completed"
+    assert state["stages"]["merge"]["status"] == "completed"
+    assert state["stages"]["unifrac"]["status"] == "completed"
+    assert state["attempts"][0]["status"] == "completed"
+    assert state["attempts"][0]["max_failed_studies"] == 1
+    assert (run_dir / "results" / "study_processing_status.tsv").is_file()
+    merge_command = next(
+        command for command in commands if Path(command[1]).name == "merge_biom.py"
+    )
+    assert "--run-state" in merge_command
 
 
 def test_missing_completed_output_reruns_stage_and_downstream(

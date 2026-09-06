@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import sys
 from pathlib import Path
 
@@ -8,10 +9,27 @@ import pytest
 import run_deblur
 from run_deblur import (
     discover_inputs,
+    filter_invalid_fastq_records,
     parse_args,
     run_deblur_workflow,
     stage_inputs_for_deblur,
 )
+
+
+def test_filter_invalid_fastq_records_drops_only_malformed_record(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.fastq.gz"
+    destination = tmp_path / "filtered.fastq.gz"
+    with gzip.open(source, "wb") as handle:
+        handle.write(b"@good\nACGT\n+\nIIII\n")
+        handle.write(b"@bad\nACGT\n+\nIII|\n")
+
+    total, dropped = filter_invalid_fastq_records(source, destination)
+
+    assert (total, dropped) == (2, 1)
+    with gzip.open(destination, "rb") as handle:
+        assert handle.read() == b"@good\nACGT\n+\nIIII\n"
 
 
 def test_discover_inputs_finds_all_matching_forward_fastqs(tmp_path: Path) -> None:

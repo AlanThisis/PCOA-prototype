@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import gzip
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -89,7 +92,39 @@ def run_deblur_workflow(
     return workflow_output_dir
 
 
-def stage_inputs_for_deblur(fastq_paths: list[Path], staging_dir: Path) -> Path:
+def filter_invalid_fastq_records(source: Path, destination: Path) -> tuple[int, int]:
+    total = 0
+    dropped = 0
+    with gzip.open(source, "rb") as input_handle, gzip.open(destination, "wb") as output_handle:
+        while True:
+            record = [input_handle.readline() for _ in range(4)]
+            if not record[0]:
+                break
+            total += 1
+            header, sequence, separator, quality = record
+            sequence = sequence.rstrip(b"\r\n")
+            quality = quality.rstrip(b"\r\n")
+            valid = (
+                all(record)
+                and header.startswith(b"@")
+                and separator.startswith(b"+")
+                and len(sequence) == len(quality)
+                and all(33 <= value <= 95 for value in quality)
+            )
+            if valid:
+                output_handle.writelines(record)
+            else:
+                dropped += 1
+    return total, dropped
+
+
+def stage_inputs_for_deblur(
+    fastq_paths: list[Path],
+    staging_dir: Path,
+    *,
+    sanitize_invalid_qualities: bool = False,
+    sanitation_report: Path | None = None,
+) -> Path:
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     by_name: dict[str, Path] = {}
@@ -102,12 +137,28 @@ def stage_inputs_for_deblur(fastq_paths: list[Path], staging_dir: Path) -> Path:
             )
         by_name[fastq_path.name] = fastq_path
 
+    sanitation_rows: list[tuple[str, int, int]] = []
     for basename, source_fastq_path in sorted(by_name.items()):
         staged_fastq_path = staging_dir / basename
+        if sanitize_invalid_qualities:
+            candidate = staging_dir / f".{basename}.filtered"
+            total, dropped = filter_invalid_fastq_records(source_fastq_path, candidate)
+            if dropped:
+                candidate.replace(staged_fastq_path)
+                sanitation_rows.append((basename, total, dropped))
+                continue
+            candidate.unlink()
         try:
             staged_fastq_path.symlink_to(source_fastq_path)
         except OSError:
             shutil.copy2(source_fastq_path, staged_fastq_path)
+
+    if sanitation_report is not None:
+        sanitation_report.parent.mkdir(parents=True, exist_ok=True)
+        with sanitation_report.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle, delimiter="\t")
+            writer.writerow(("fastq", "records_scanned", "records_dropped"))
+            writer.writerows(sanitation_rows)
 
     return staging_dir
 
@@ -131,17 +182,53 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
     ) as tmp_dir:
         with timing.step("stage_deblur_inputs", item=f"{len(fastq_paths)} FASTQs"):
             staged_inputs_dir = stage_inputs_for_deblur(fastq_paths, Path(tmp_dir))
-        workflow_output_dir = run_deblur_workflow(
-            staged_inputs_dir,
-            args.work_dir,
-            args.trim_length,
-            args.error_dist,
-            args.min_reads,
-            args.jobs_to_start,
-            deblur_executable_path,
-            timing,
-            args.keep_tmp_files,
-        )
+        try:
+            workflow_output_dir = run_deblur_workflow(
+                staged_inputs_dir,
+                args.work_dir,
+                args.trim_length,
+                args.error_dist,
+                args.min_reads,
+                args.jobs_to_start,
+                deblur_executable_path,
+                timing,
+                args.keep_tmp_files,
+            )
+        except subprocess.CalledProcessError:
+            report = args.work_dir / "invalid_fastq_records.tsv"
+            with tempfile.TemporaryDirectory(
+                prefix="deblur-sanitized-inputs-", dir=str(args.work_dir)
+            ) as sanitized_tmp_dir:
+                sanitized_inputs = stage_inputs_for_deblur(
+                    fastq_paths,
+                    Path(sanitized_tmp_dir),
+                    sanitize_invalid_qualities=True,
+                    sanitation_report=report,
+                )
+                with report.open(encoding="utf-8") as handle:
+                    dropped = sum(
+                        int(row["records_dropped"])
+                        for row in csv.DictReader(handle, delimiter="\t")
+                    )
+                if dropped == 0:
+                    report.unlink()
+                    raise
+                print(
+                    f"Deblur failed with {dropped} invalid FASTQ record(s); "
+                    f"retrying with sanitized temporary inputs. Report: {report}",
+                    flush=True,
+                )
+                workflow_output_dir = run_deblur_workflow(
+                    sanitized_inputs,
+                    args.work_dir,
+                    args.trim_length,
+                    args.error_dist,
+                    args.min_reads,
+                    args.jobs_to_start,
+                    deblur_executable_path,
+                    timing,
+                    args.keep_tmp_files,
+                )
     print(f"Finished. Deblur outputs written under: {workflow_output_dir}")
     return 0
 
