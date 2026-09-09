@@ -19,11 +19,17 @@ from pipeline_lib import (
 )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run forward-read Deblur processing for all discovered samples."
     )
-    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    inputs = parser.add_mutually_exclusive_group()
+    inputs.add_argument("--data-dir", type=Path, default=None)
+    inputs.add_argument(
+        "--input-manifest",
+        type=Path,
+        help="Text file containing one prepared forward-FASTQ path per line.",
+    )
     parser.add_argument("--work-dir", type=Path, default=Path("work/deblur"))
     parser.add_argument("--trim-length", type=int, default=150)
     parser.add_argument(
@@ -46,7 +52,31 @@ def parse_args() -> argparse.Namespace:
         help="Retain Deblur workflow internals for debugging (large; disabled by default).",
     )
     add_timing_argument(parser)
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def load_input_manifest(path: Path) -> list[Path]:
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"FASTQ input manifest not found: {path}")
+    fastq_paths = [
+        Path(line.strip()).expanduser().resolve()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not fastq_paths:
+        raise ValueError(f"FASTQ input manifest is empty: {path}")
+    missing = [
+        path
+        for path in fastq_paths
+        if not path.is_file() or path.stat().st_size == 0
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "Manifest contains missing or empty FASTQ(s): "
+            + ", ".join(str(path) for path in missing[:10])
+        )
+    return sorted(fastq_paths)
 
 
 def run_deblur_workflow(
@@ -164,15 +194,22 @@ def stage_inputs_for_deblur(
 
 
 def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
-    args.data_dir = args.data_dir.resolve()
+    if args.data_dir is None and args.input_manifest is None:
+        args.data_dir = Path("data")
+    if args.data_dir is not None:
+        args.data_dir = args.data_dir.resolve()
     args.work_dir = args.work_dir.resolve()
     args.work_dir.mkdir(parents=True, exist_ok=True)
 
     deblur_executable_path = resolve_executable("deblur")
-    with timing.step("discover_forward_fastqs", item=str(args.data_dir)):
-        fastq_paths = discover_inputs(args.data_dir)
+    input_description = args.input_manifest or args.data_dir
+    with timing.step("discover_forward_fastqs", item=str(input_description)):
+        if args.input_manifest is not None:
+            fastq_paths = load_input_manifest(args.input_manifest)
+        else:
+            fastq_paths = discover_inputs(args.data_dir)
     print(
-        f"Discovered {len(fastq_paths)} forward-read FASTQs under {args.data_dir}.",
+        f"Discovered {len(fastq_paths)} forward-read FASTQs from {input_description}.",
         flush=True,
     )
     print("Running deblur workflow directly on discovered FASTQs.", flush=True)

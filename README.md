@@ -186,10 +186,16 @@ runs/prjeb44533/sub10-001/
 ├── run_state.json
 ├── timings/attempt-001/
 ├── work/
-│   ├── deblur/PRJEB44533/workflow/
+│   ├── deblur-balanced/
+│   │   ├── shard_manifest.tsv
+│   │   ├── nodes/
+│   │   └── workflow/
 │   └── qiime2/
 └── results/
-    ├── distance_matrix_unweighted_unifrac.tsv
+    ├── analysis_summary.json
+    ├── deblur_processing_summary.json
+    ├── sample_processing_status.tsv
+    ├── pipeline_summary.json
     ├── pcoa_coordinates_unweighted_unifrac.txt
     ├── pcoa_plot_unweighted_unifrac.png
     └── pcoa_description.png
@@ -202,9 +208,10 @@ default; add `--keep-deblur-tmp-files` only when diagnosing Deblur.
 
 ### Cross-study Runs
 
-Repeat `--study NAME=FASTQ_DIR` to process multiple studies. Each study is
-Deblurred separately, then their `all.biom` and `all.seqs.fa` artifacts are
-merged before one shared GG2/UniFrac analysis:
+Repeat `--study NAME=FASTQ_DIR` to process multiple studies. By default, the
+pipeline assigns individual FASTQs to deterministic, workload-balanced Deblur
+shards across study boundaries, merges the successful shards, and performs one
+shared GG2/UniFrac analysis:
 
 ```bash
 python src/run_pipeline.py \
@@ -219,35 +226,61 @@ python src/run_pipeline.py \
   --threads 16
 ```
 
-Study names and sample identifiers must be unique. For a single study, the
-merge stage is skipped and that study's Deblur workflow is passed directly to
-UniFrac.
+Study names and sample identifiers must be unique. Study provenance is retained
+in the shard manifest and metadata; study size no longer determines how many
+CPUs its samples receive.
 
-Deblur can also process independent studies concurrently while keeping its
-total sample-job concurrency within the allocated CPU count. For example, a
-32-CPU allocation can run eight studies with four Deblur jobs per study:
+With 32 CPUs, the defaults create 64 initial shards, run up to 16 shards at
+once, and give each shard two Deblur processes. Shard weight is compressed
+FASTQ size plus the dataset median file size, which accounts for both read work
+and per-sample overhead. Override these defaults only for measured tuning:
 
 ```bash
 python src/run_pipeline.py \
   ... \
   --threads 32 \
-  --deblur-study-workers 8 \
-  --deblur-jobs-per-study 4
+  --deblur-shard-workers 2 \
+  --deblur-shard-count 64
 ```
 
-The default remains one study at a time. If `--deblur-jobs-per-study` is
-omitted, the pipeline divides `--threads` across the active study workers and
-rejects configurations that would oversubscribe the allocation.
+A persistently failing shard is recursively split by cumulative workload until
+the problematic FASTQ is isolated. All unaffected samples still finish. The
+default permits persistent failures for at most 2% of samples; use
+`--max-failed-samples` for an explicit absolute limit. Every input receives a
+status in `sample_processing_status.tsv`: `completed`,
+`completed_after_sanitation`, `zero_features`, `failed`, or
+`excluded_assay`. Exceeding the configured limit blocks GG2 and PCoA. The
+legacy study scheduler remains available with `--deblur-scheduler study` and
+its existing `--deblur-study-workers`, `--deblur-jobs-per-study`, and
+`--max-failed-studies` options.
+
+Known non-target assays can be removed explicitly with
+`--exclude-samples path/to/excluded_runs.tsv`. The file may be a one-ID-per-line
+text file or a CSV/TSV with `sample_id`, `sample-id`, `run_accession`, or
+`run_accessions`. IDs must match the prepared FASTQs exactly. These rows remain
+visible as `excluded_assay` in the processing report but are never sent to
+Deblur.
 
 `unifrac.py` uses GG2's `non-v4-16s` closed-reference action (vsearch at 99%) to map Deblur ASVs onto the GG2 backbone, then computes UniFrac against the GG2 ID phylogeny. Rarefaction depth defaults to 1,000 reads after backbone mapping; override with `--sampling-depth`.
+
+PCoA defaults to `--pcoa-method auto`. It estimates exact eigendecomposition
+memory as `72 × samples²` bytes after rarefaction. Exact PCoA is used when the
+estimate fits within 80% of `--pcoa-memory-budget-gb`, the SLURM memory
+allocation, or detected available RAM; otherwise QIIME2 FSVD computes the first
+10 axes (configurable with `--pcoa-dimensions`). The UniFrac distance QZA is
+always retained. `--export-distance-tsv auto` skips only the redundant text
+copy when its projected size exceeds 20 GiB; use `always` or `never` to force a
+policy.
 
 ### Resume a Failed Run
 
 Existing runs are never resumed implicitly. Rerun the same command with
-`--resume`; inputs, metadata, GG2 path, Git commit, and scientific parameters
+`--resume`; inputs, metadata, GG2 path, scheduler layout, and scientific parameters
 must match the saved manifest. FASTQs, metadata, and GG2 artifacts are compared
 using their resolved path, size, and modification time. `--threads` may differ
-between attempts.
+between attempts only for the legacy study scheduler; balanced shard layout is
+part of its resume contract. Completed shard nodes are reused, including after
+a failed parent has already been split.
 
 ```bash
 python src/run_pipeline.py \
@@ -285,9 +318,11 @@ examples, environment overrides, and monitoring commands.
 | `src/run_pipeline.py` | QIIME2 + repo extras | Canonical prepared-FASTQ pipeline orchestrator |
 | `src/subsample_fastq.py` | QIIME2 + repo extras | Subsample FASTQs to a given percent with seqkit |
 | `src/run_deblur.py` | QIIME2 + repo extras | Run Deblur on a directory of forward FASTQs |
+| `src/deblur_scheduler.py` | QIIME2 + repo extras | Balance Deblur shards and isolate sample-level failures |
 | `src/merge_biom.py` | QIIME2 + repo extras | Merge BIOM tables across studies |
 | `src/unifrac.py` | QIIME2 + repo extras | UniFrac PCoA via GG2 and QIIME2 |
 | `src/plot_pcoa.py` | QIIME2 + repo extras | Plot PCoA coordinates colored by metadata |
+| `src/validate_pipeline_run.py` | Python | Validate terminal state and required outputs |
 | `src/get_ENA_metadata.py` | QIIME2 + repo extras | Fetch sample metadata CSV for an ENA project |
 
 ### Runtime Profiling
@@ -338,9 +373,11 @@ They remain available for inspecting or rerunning individual boundaries:
 
 ```bash
 python src/run_deblur.py --help
+python src/deblur_scheduler.py --help
 python src/merge_biom.py --help
 python src/unifrac.py --help
 python src/plot_pcoa.py --help
+python src/validate_pipeline_run.py --run-dir runs/example
 ```
 
 ### Inputs

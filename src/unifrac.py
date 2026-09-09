@@ -20,6 +20,7 @@ Approach:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import tempfile
@@ -103,6 +104,29 @@ def parse_args() -> argparse.Namespace:
             "GG2 mapping. Used when upstream Deblur or merge outputs were regenerated."
         ),
     )
+    parser.add_argument(
+        "--pcoa-method",
+        choices=("auto", "eigh", "fsvd"),
+        default="auto",
+        help="PCoA eigensolver. Auto uses the memory budget to choose exact or FSVD.",
+    )
+    parser.add_argument(
+        "--pcoa-dimensions",
+        type=int,
+        default=10,
+        help="Axes requested from FSVD (default: 10).",
+    )
+    parser.add_argument(
+        "--pcoa-memory-budget-gb",
+        type=float,
+        help="Memory budget for auto PCoA selection; defaults to SLURM allocation or available RAM.",
+    )
+    parser.add_argument(
+        "--export-distance-tsv",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="Export the distance QZA to TSV; auto skips projected exports over 20 GiB.",
+    )
     add_timing_argument(parser)
     return parser.parse_args()
 
@@ -117,6 +141,58 @@ def auto_sampling_depth(biom_fp: Path) -> int:
             "Greengenes2 backbone mapping."
         )
     return int(positive_depths.min())
+
+
+def system_available_memory_gb() -> float:
+    slurm_mb = os.environ.get("SLURM_MEM_PER_NODE")
+    if slurm_mb:
+        try:
+            return float(slurm_mb) / 1024
+        except ValueError:
+            pass
+    slurm_per_cpu_mb = os.environ.get("SLURM_MEM_PER_CPU")
+    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+    if slurm_per_cpu_mb and slurm_cpus:
+        try:
+            return float(slurm_per_cpu_mb) * int(slurm_cpus) / 1024
+        except ValueError:
+            pass
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        available_pages = os.sysconf("SC_AVPHYS_PAGES")
+        return page_size * available_pages / (1024**3)
+    except (AttributeError, OSError, ValueError):
+        return 4.0
+
+
+def choose_pcoa_method(
+    requested: str,
+    sample_count: int,
+    memory_budget_gb: float | None,
+) -> dict[str, float | int | str]:
+    budget_gb = memory_budget_gb or system_available_memory_gb()
+    estimate_bytes = 72 * sample_count * sample_count
+    estimate_gb = estimate_bytes / (1024**3)
+    method = requested
+    if requested == "auto":
+        method = "eigh" if estimate_gb <= 0.8 * budget_gb else "fsvd"
+    return {
+        "requested_method": requested,
+        "selected_method": method,
+        "sample_count": sample_count,
+        "estimated_exact_memory_gb": estimate_gb,
+        "memory_budget_gb": budget_gb,
+        "auto_budget_fraction": 0.8,
+    }
+
+
+def should_export_distance_tsv(policy: str, sample_count: int) -> tuple[bool, float]:
+    projected_gib = (16 * sample_count * sample_count) / (1024**3)
+    if policy == "always":
+        return True, projected_gib
+    if policy == "never":
+        return False, projected_gib
+    return projected_gib <= 20, projected_gib
 
 
 def import_artifact(
@@ -157,7 +233,9 @@ def export_artifact(
     timing: TimingRecorder | None = None,
     step: str = "export_artifact",
 ) -> None:
-    export_dir.mkdir(parents=True, exist_ok=True)
+    if export_dir.exists():
+        shutil.rmtree(export_dir)
+    export_dir.parent.mkdir(parents=True, exist_ok=True)
     run_command(
         [
             qiime,
@@ -184,7 +262,10 @@ def run_qiime2_unifrac(
     work_dir: Path,
     qiime: str,
     timing: TimingRecorder,
-) -> tuple[Path, int]:
+    pcoa_method: str = "auto",
+    pcoa_dimensions: int = 10,
+    pcoa_memory_budget_gb: float | None = None,
+) -> tuple[Path, int, dict[str, float | int | str]]:
     """Run QIIME2 import → backbone mapping → rarefied UniFrac PCoA.
 
     Returns (work dir containing UniFrac artifacts, sampling depth used).
@@ -285,6 +366,33 @@ def run_qiime2_unifrac(
         item=f"depth={sampling_depth}",
     )
 
+    rarefied_stats = table_stats_from_qza(
+        qiime,
+        rarefied_table_qza,
+        work_dir / "_rarefied_table_export",
+        timing,
+        "export_rarefied_table_for_policy",
+    )
+    retained_sample_count = rarefied_stats["sample_count"]
+    if retained_sample_count < 2:
+        raise ValueError(
+            "PCoA requires at least two samples after rarefaction; "
+            f"found {retained_sample_count}"
+        )
+    pcoa_policy = choose_pcoa_method(
+        pcoa_method, retained_sample_count, pcoa_memory_budget_gb
+    )
+    effective_pcoa_dimensions = min(pcoa_dimensions, retained_sample_count)
+    pcoa_policy["requested_dimensions"] = pcoa_dimensions
+    pcoa_policy["dimensions"] = effective_pcoa_dimensions
+    selected_pcoa_method = str(pcoa_policy["selected_method"])
+    print(
+        f"  PCoA method: {selected_pcoa_method} "
+        f"(exact estimate {pcoa_policy['estimated_exact_memory_gb']:.2f} GiB; "
+        f"budget {pcoa_policy['memory_budget_gb']:.2f} GiB)",
+        flush=True,
+    )
+
     print("Step 5/5: Computing unweighted UniFrac distance matrix and PCoA...")
     if distance_matrix_qza.exists():
         distance_matrix_qza.unlink()
@@ -311,22 +419,41 @@ def run_qiime2_unifrac(
 
     if pcoa_qza.exists():
         pcoa_qza.unlink()
+    pcoa_command = [
+        qiime,
+        "diversity",
+        "pcoa",
+        "--i-distance-matrix",
+        str(distance_matrix_qza),
+        "--o-pcoa",
+        str(pcoa_qza),
+    ]
+    # q2-diversity selects exact eigh when dimensions are omitted and FSVD
+    # when a reduced dimensionality is supplied.
+    if selected_pcoa_method == "fsvd":
+        pcoa_command.extend(
+            ("--p-number-of-dimensions", str(effective_pcoa_dimensions))
+        )
     run_command(
-        [
-            qiime,
-            "diversity",
-            "pcoa",
-            "--i-distance-matrix",
-            str(distance_matrix_qza),
-            "--o-pcoa",
-            str(pcoa_qza),
-        ],
+        pcoa_command,
         timing=timing,
         step="pcoa",
         item=str(pcoa_qza),
     )
 
-    return work_dir, sampling_depth
+    return work_dir, sampling_depth, pcoa_policy
+
+
+def table_stats_from_qza(
+    qiime: str,
+    table_qza: Path,
+    export_dir: Path,
+    timing: TimingRecorder,
+    step: str,
+) -> dict[str, int]:
+    export_artifact(qiime, table_qza, export_dir, timing=timing, step=step)
+    table = biom.load_table(str(export_dir / "feature-table.biom"))
+    return {"sample_count": table.shape[1], "feature_count": table.shape[0]}
 
 
 def auto_sampling_depth_from_qza(
@@ -396,6 +523,10 @@ def plot_pcoa(ordination_fp: Path, plot_fp: Path, title: str) -> None:
 
 
 def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
+    if args.pcoa_dimensions < 2:
+        raise ValueError("--pcoa-dimensions must be at least two")
+    if args.pcoa_memory_budget_gb is not None and args.pcoa_memory_budget_gb <= 0:
+        raise ValueError("--pcoa-memory-budget-gb must be greater than zero")
     args.deblur_dir = args.deblur_dir.resolve()
     args.results_dir = args.results_dir.resolve()
     args.gg2_dir = args.gg2_dir.resolve()
@@ -444,7 +575,7 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
     if args.refresh_input_artifacts:
         clear_input_artifact_cache(work_dir)
 
-    unifrac_work_dir, sampling_depth = run_qiime2_unifrac(
+    unifrac_work_dir, sampling_depth, pcoa_policy = run_qiime2_unifrac(
         biom_fp=biom_fp,
         seqs_fp=seqs_fp,
         gg2_backbone_fp=gg2_backbone_fp,
@@ -454,23 +585,35 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
         work_dir=work_dir,
         qiime=qiime,
         timing=timing,
+        pcoa_method=args.pcoa_method,
+        pcoa_dimensions=args.pcoa_dimensions,
+        pcoa_memory_budget_gb=args.pcoa_memory_budget_gb,
     )
 
     args.results_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Exporting UniFrac distance matrix...")
-    dm_export_dir = work_dir / "unweighted_unifrac_dm_export"
-    export_artifact(
-        qiime,
-        unifrac_work_dir / "unweighted_unifrac_distance_matrix.qza",
-        dm_export_dir,
-        timing=timing,
-        step="export_distance_matrix",
+    export_distance, projected_distance_gib = should_export_distance_tsv(
+        args.export_distance_tsv, int(pcoa_policy["sample_count"])
     )
-    with timing.step("copy_distance_matrix"):
-        shutil.copy(
-            dm_export_dir / "distance-matrix.tsv",
-            args.results_dir / "distance_matrix_unweighted_unifrac.tsv",
+    distance_result = args.results_dir / "distance_matrix_unweighted_unifrac.tsv"
+    if export_distance:
+        print("Exporting UniFrac distance matrix...")
+        dm_export_dir = work_dir / "unweighted_unifrac_dm_export"
+        export_artifact(
+            qiime,
+            unifrac_work_dir / "unweighted_unifrac_distance_matrix.qza",
+            dm_export_dir,
+            timing=timing,
+            step="export_distance_matrix",
+        )
+        with timing.step("copy_distance_matrix"):
+            shutil.copy(dm_export_dir / "distance-matrix.tsv", distance_result)
+    else:
+        distance_result.unlink(missing_ok=True)
+        timing.skipped(
+            "export_distance_matrix",
+            item=str(distance_result),
+            message=f"policy={args.export_distance_tsv}; projected={projected_distance_gib:.2f} GiB",
         )
 
     print("Exporting UniFrac PCoA...")
@@ -496,6 +639,31 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
             plot_fp=args.results_dir / "pcoa_plot_unweighted_unifrac.png",
             title=f"PCoA — Unweighted UniFrac (Greengenes2 backbone, depth={sampling_depth})",
         )
+
+    mapped_stats = table_stats_from_qza(
+        qiime,
+        work_dir / "backbone-mapped-table.qza",
+        work_dir / "_mapped_table_summary_export",
+        timing,
+        "export_mapped_table_for_summary",
+    )
+    analysis_summary = {
+        "sampling_depth": sampling_depth,
+        "mapped_samples": mapped_stats["sample_count"],
+        "mapped_features": mapped_stats["feature_count"],
+        "rarefied_samples": pcoa_policy["sample_count"],
+        "pcoa": pcoa_policy,
+        "pcoa_dimensions": args.pcoa_dimensions,
+        "distance_tsv": {
+            "policy": args.export_distance_tsv,
+            "exported": export_distance,
+            "projected_size_gib": projected_distance_gib,
+            "qza_path": str(work_dir / "unweighted_unifrac_distance_matrix.qza"),
+        },
+    }
+    with (args.results_dir / "analysis_summary.json").open("w", encoding="utf-8") as handle:
+        json.dump(analysis_summary, handle, indent=2, sort_keys=True)
+        handle.write("\n")
 
     print(f"\nFinished. Outputs written under: {args.results_dir}")
     return 0

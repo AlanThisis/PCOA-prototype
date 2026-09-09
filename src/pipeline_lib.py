@@ -219,9 +219,11 @@ def run_command(
     timing: TimingRecorder | None = None,
     step: str | None = None,
     item: str = "",
+    stdout: object | None = None,
+    stderr: object | None = None,
 ) -> None:
     if timing is not None and step is not None:
         with timing.step(step, item=item, command=shlex.join(args)):
-            subprocess.run(args, check=True, cwd=cwd)
+            subprocess.run(args, check=True, cwd=cwd, stdout=stdout, stderr=stderr)
         return
-    subprocess.run(args, check=True, cwd=cwd)
+    subprocess.run(args, check=True, cwd=cwd, stdout=stdout, stderr=stderr)

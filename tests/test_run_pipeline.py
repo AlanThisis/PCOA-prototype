@@ -52,7 +52,21 @@ def install_fake_environment(
         script = Path(command[1]).name
         if script == fail_script:
             raise RuntimeError(f"injected failure in {script}")
-        if script == "run_deblur.py":
+        if script == "deblur_scheduler.py":
+            work_dir = command_value(command, "--work-dir")
+            output_dir = work_dir / "workflow"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "all.biom").write_bytes(b"biom")
+            (output_dir / "all.seqs.fa").write_bytes(b"fasta")
+            results_dir = command_value(command, "--results-dir")
+            results_dir.mkdir(parents=True, exist_ok=True)
+            (results_dir / "sample_processing_status.tsv").write_text(
+                "sample_id\tstudy\tfastq_path\tstatus\tnode_id\tmessage\n"
+            )
+            (results_dir / "deblur_processing_summary.json").write_text(
+                '{"status":"completed","counts":{"expected":0,"completed":0,"completed_after_sanitation":0,"zero_features":0,"failed":0,"excluded_assay":0}}\n'
+            )
+        elif script == "run_deblur.py":
             output_dir = command_value(command, "--work-dir") / "workflow"
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "all.biom").write_bytes(b"biom")
@@ -67,7 +81,10 @@ def install_fake_environment(
             output_dir = command_value(command, "--results-dir")
             output_dir.mkdir(parents=True, exist_ok=True)
             for filename in run_pipeline.UNIFRAC_OUTPUT_NAMES:
-                (output_dir / filename).write_bytes(b"result")
+                if filename.endswith(".json"):
+                    (output_dir / filename).write_text('{"rarefied_samples": 1}\n')
+                else:
+                    (output_dir / filename).write_bytes(b"result")
         elif script == "plot_pcoa.py":
             output_path = command_value(command, "--out")
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,6 +121,8 @@ def make_args(
             "0",
             "--threads",
             "16",
+            "--deblur-scheduler",
+            "study",
         )
     )
     if metadata:
@@ -298,6 +317,82 @@ def test_deblur_parallelism_rejects_oversubscription() -> None:
 
     with pytest.raises(ValueError, match="oversubscribes"):
         run_pipeline.resolve_deblur_parallelism(Args(), 8)
+
+
+def test_balanced_shards_use_lpt_weighting_and_all_threads(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    paths = [
+        write_fastq(first, "A"),
+        write_fastq(first, "B"),
+        write_fastq(second, "C"),
+        write_fastq(second, "D"),
+    ]
+    for path, size in zip(paths, (100, 80, 20, 10), strict=True):
+        path.write_bytes(b"x" * size)
+    studies = run_pipeline.parse_studies([f"one={first}", f"two={second}"])
+
+    rows = run_pipeline.balanced_shard_rows(studies, 2)
+
+    totals = [
+        sum(int(row["weight_bytes"]) for row in rows if row["shard_id"] == shard)
+        for shard in range(2)
+    ]
+    assert abs(totals[0] - totals[1]) <= max(int(row["weight_bytes"]) for row in rows)
+    assert sorted(row["sample_id"] for row in rows) == ["A", "B", "C", "D"]
+
+
+def test_balanced_scheduler_is_default_and_bypasses_study_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    write_fastq(first, "ERR1")
+    write_fastq(second, "ERR2")
+    commands: list[list[str]] = []
+    install_fake_environment(monkeypatch, commands)
+    args = make_args(
+        tmp_path,
+        [("one", first), ("two", second)],
+        extra=["--deblur-scheduler", "balanced-shards"],
+    )
+
+    run_dir = run_pipeline.execute_pipeline(args)
+
+    assert [Path(command[1]).name for command in commands] == [
+        "deblur_scheduler.py",
+        "unifrac.py",
+    ]
+    assert (run_dir / "work" / "deblur-balanced" / "shard_manifest.tsv").is_file()
+    state = json.loads((run_dir / "run_state.json").read_text())
+    assert set(state["stages"]) == {"deblur:balanced", "unifrac"}
+    assert state["attempts"][0]["deblur_concurrent_shards"] == 8
+
+
+def test_balanced_manifest_records_exact_assay_exclusions(tmp_path: Path) -> None:
+    study = tmp_path / "study"
+    write_fastq(study, "SIXTEEN_S")
+    write_fastq(study, "ITS")
+    exclusions = tmp_path / "excluded.tsv"
+    exclusions.write_text("run_accession\treason\nITS\tknown ITS assay\n")
+    args = make_args(
+        tmp_path,
+        [("study", study)],
+        extra=[
+            "--deblur-scheduler",
+            "balanced-shards",
+            "--exclude-samples",
+            str(exclusions),
+        ],
+    )
+    studies = run_pipeline.parse_studies(args.study)
+
+    rows = run_pipeline.balanced_shard_rows(studies, 1, {"ITS"})
+
+    by_sample = {str(row["sample_id"]): row for row in rows}
+    assert by_sample["ITS"]["excluded_assay"] == 1
+    assert by_sample["ITS"]["shard_id"] == -1
+    assert by_sample["SIXTEEN_S"]["excluded_assay"] == 0
 
 
 def test_concurrent_deblur_failure_leaves_resumable_state(

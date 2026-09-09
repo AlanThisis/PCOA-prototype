@@ -8,6 +8,7 @@ import json
 import os
 import re
 import socket
+import statistics
 import subprocess
 import sys
 import threading
@@ -23,9 +24,9 @@ STUDY_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 GG2_BACKBONE_FILENAME = "2024.09.backbone.full-length.fna.qza"
 GG2_ID_TREE_FILENAME = "2024.09.phylogeny.id.nwk.qza"
 UNIFRAC_OUTPUT_NAMES = (
-    "distance_matrix_unweighted_unifrac.tsv",
     "pcoa_coordinates_unweighted_unifrac.txt",
     "pcoa_plot_unweighted_unifrac.png",
+    "analysis_summary.json",
 )
 
 
@@ -65,6 +66,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--metadata", type=Path)
     parser.add_argument(
+        "--exclude-samples",
+        type=Path,
+        help=(
+            "Optional TXT/TSV/CSV exact sample-ID manifest to exclude known "
+            "non-target assays before Deblur."
+        ),
+    )
+    parser.add_argument(
         "--color-by",
         action="append",
         default=[],
@@ -84,6 +93,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--gg2-dir", type=Path, default=Path("data/gg2"))
     parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument(
+        "--deblur-scheduler",
+        choices=("balanced-shards", "study"),
+        default="balanced-shards",
+        help="Deblur scheduling policy (default: balanced-shards).",
+    )
+    parser.add_argument(
+        "--deblur-shard-workers",
+        type=int,
+        default=2,
+        help="Deblur processes within each balanced shard (default: 2).",
+    )
+    parser.add_argument(
+        "--deblur-shard-count",
+        type=int,
+        help="Initial balanced shard count (default: 2 x --threads).",
+    )
     parser.add_argument(
         "--deblur-study-workers",
         type=int,
@@ -110,6 +136,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Maximum number of persistently failed Deblur studies that may be "
             "excluded before merge (default: 0). Exclusions are recorded."
         ),
+    )
+    parser.add_argument(
+        "--max-failed-fraction",
+        type=float,
+        default=0.02,
+        help="Maximum persistently failed sample fraction in balanced mode (default: 0.02).",
+    )
+    parser.add_argument(
+        "--max-failed-samples",
+        type=int,
+        help="Absolute failed-sample limit; overrides --max-failed-fraction.",
+    )
+    parser.add_argument(
+        "--pcoa-method",
+        choices=("auto", "eigh", "fsvd"),
+        default="auto",
+    )
+    parser.add_argument("--pcoa-dimensions", type=int, default=10)
+    parser.add_argument("--pcoa-memory-budget-gb", type=float)
+    parser.add_argument(
+        "--export-distance-tsv",
+        choices=("auto", "always", "never"),
+        default="auto",
     )
     parser.add_argument(
         "--resume",
@@ -215,7 +264,45 @@ def validate_metadata(metadata: Path | None, color_by: list[str]) -> Path | None
     return metadata
 
 
-def validate_args(args: argparse.Namespace) -> tuple[list[Study], Path | None, dict[str, str]]:
+def load_sample_id_manifest(path: Path) -> set[str]:
+    path = path.expanduser().resolve()
+    if not path.is_file() or path.stat().st_size == 0:
+        raise FileNotFoundError(f"Sample exclusion manifest not found or empty: {path}")
+    if path.suffix.lower() in {".csv", ".tsv"}:
+        delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
+        with path.open(newline="", encoding="utf-8-sig") as handle:
+            rows = list(csv.DictReader(handle, delimiter=delimiter))
+        if not rows:
+            raise ValueError(f"Sample exclusion manifest has no data rows: {path}")
+        fields = rows[0].keys()
+        id_column = next(
+            (
+                column
+                for column in ("sample_id", "sample-id", "run_accessions", "run_accession")
+                if column in fields
+            ),
+            None,
+        )
+        if id_column is None:
+            raise ValueError(
+                "Sample exclusion table needs sample_id, sample-id, run_accessions, "
+                "or run_accession"
+            )
+        values = {row[id_column].strip() for row in rows if row[id_column].strip()}
+    else:
+        values = {
+            line.strip()
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+    if not values:
+        raise ValueError(f"Sample exclusion manifest contains no IDs: {path}")
+    return values
+
+
+def validate_args(
+    args: argparse.Namespace,
+) -> tuple[list[Study], Path | None, dict[str, str]]:
     if args.trim_length <= 0:
         raise ValueError("--trim-length must be greater than zero")
     if args.min_reads < 0:
@@ -230,11 +317,52 @@ def validate_args(args: argparse.Namespace) -> tuple[list[Study], Path | None, d
         raise ValueError("--deblur-jobs-per-study must be greater than zero")
     if args.max_failed_studies < 0:
         raise ValueError("--max-failed-studies cannot be negative")
+    if args.deblur_shard_workers <= 0:
+        raise ValueError("--deblur-shard-workers must be greater than zero")
+    if args.deblur_shard_count is not None and args.deblur_shard_count <= 0:
+        raise ValueError("--deblur-shard-count must be greater than zero")
+    if not 0 <= args.max_failed_fraction <= 1:
+        raise ValueError("--max-failed-fraction must be between zero and one")
+    if args.max_failed_samples is not None and args.max_failed_samples < 0:
+        raise ValueError("--max-failed-samples cannot be negative")
+    if args.pcoa_dimensions < 2:
+        raise ValueError("--pcoa-dimensions must be at least two")
+    if args.pcoa_memory_budget_gb is not None and args.pcoa_memory_budget_gb <= 0:
+        raise ValueError("--pcoa-memory-budget-gb must be greater than zero")
+    if args.deblur_scheduler == "balanced-shards" and args.min_reads != 0:
+        raise ValueError("Balanced Deblur scheduling requires --min-reads 0")
     if not args.error_dist.strip():
         raise ValueError("--error-dist cannot be empty")
 
     studies = parse_studies(args.study)
-    resolve_deblur_parallelism(args, len(studies))
+    excluded_samples: set[str] = set()
+    if args.exclude_samples is not None:
+        if args.deblur_scheduler != "balanced-shards":
+            raise ValueError(
+                "--exclude-samples requires --deblur-scheduler balanced-shards"
+            )
+        args.exclude_samples = args.exclude_samples.expanduser().resolve()
+        excluded_samples = load_sample_id_manifest(args.exclude_samples)
+        available = {
+            sample_id_from_fastq(path)
+            for study in studies
+            for path in study.fastq_paths
+        }
+        unknown = sorted(excluded_samples - available)
+        if unknown:
+            raise ValueError(
+                "Sample exclusion manifest contains IDs absent from FASTQ inputs: "
+                + ", ".join(unknown[:10])
+            )
+        if excluded_samples == available:
+            raise ValueError("Sample exclusion manifest excludes every FASTQ input")
+    if args.deblur_scheduler == "study":
+        resolve_deblur_parallelism(args, len(studies))
+    else:
+        resolve_balanced_parallelism(
+            args,
+            sum(len(study.fastq_paths) for study in studies) - len(excluded_samples),
+        )
     metadata = validate_metadata(args.metadata, args.color_by)
     gg2_dir = args.gg2_dir.expanduser().resolve()
     missing_gg2 = [
@@ -277,6 +405,79 @@ def resolve_deblur_parallelism(
             f"{requested_jobs}, but --threads={args.threads}"
         )
     return study_workers, jobs_per_study
+
+
+def resolve_balanced_parallelism(
+    args: argparse.Namespace, sample_count: int
+) -> tuple[int, int, int]:
+    if sample_count <= 0:
+        raise ValueError("At least one FASTQ is required")
+    shard_workers = args.deblur_shard_workers
+    concurrent_shards = max(1, args.threads // shard_workers)
+    if concurrent_shards * shard_workers > args.threads:
+        raise ValueError("Balanced Deblur parallelism oversubscribes --threads")
+    requested_shards = args.deblur_shard_count or (2 * args.threads)
+    return min(requested_shards, sample_count), concurrent_shards, shard_workers
+
+
+def eligible_sample_count(args: argparse.Namespace, studies: list[Study]) -> int:
+    total = sum(len(study.fastq_paths) for study in studies)
+    excluded = (
+        len(load_sample_id_manifest(args.exclude_samples))
+        if args.exclude_samples
+        else 0
+    )
+    return total - excluded
+
+
+def balanced_shard_rows(
+    studies: list[Study], shard_count: int, excluded_samples: set[str] | None = None
+) -> list[dict[str, str | int]]:
+    excluded_samples = excluded_samples or set()
+    paths = [path for study in studies for path in study.fastq_paths]
+    median_size = int(statistics.median(path.stat().st_size for path in paths))
+    weighted = [
+        (
+            path.stat().st_size + median_size,
+            sample_id_from_fastq(path),
+            study.name,
+            path,
+            path.stat().st_size,
+        )
+        for study in studies
+        for path in study.fastq_paths
+    ]
+    totals = [0] * shard_count
+    rows: list[dict[str, str | int]] = []
+    for weight, sample_id, study_name, path, size in sorted(
+        weighted, key=lambda item: (-item[0], item[1], item[2])
+    ):
+        excluded = sample_id in excluded_samples
+        shard_id = -1 if excluded else min(
+            range(shard_count), key=lambda index: (totals[index], index)
+        )
+        if not excluded:
+            totals[shard_id] += weight
+        rows.append(
+            {
+                "sample_id": sample_id,
+                "study": study_name,
+                "fastq_path": str(path),
+                "size_bytes": size,
+                "weight_bytes": weight,
+                "shard_id": shard_id,
+                "excluded_assay": int(excluded),
+            }
+        )
+    return sorted(rows, key=lambda row: (int(row["shard_id"]), str(row["sample_id"])))
+
+
+def write_shard_manifest(path: Path, rows: list[dict[str, str | int]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]), delimiter="\t")
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def validate_qiime_gg2(qiime: str) -> None:
@@ -324,6 +525,25 @@ def build_manifest(
     repo_dir: Path,
 ) -> dict[str, Any]:
     commit, tracked_dirty = git_info(repo_dir)
+    sample_count = sum(len(study.fastq_paths) for study in studies)
+    excluded_samples = (
+        load_sample_id_manifest(args.exclude_samples) if args.exclude_samples else set()
+    )
+    balanced = None
+    if args.deblur_scheduler == "balanced-shards":
+        shard_count, concurrent_shards, shard_workers = resolve_balanced_parallelism(
+            args, sample_count - len(excluded_samples)
+        )
+        balanced = {
+            "shard_count": shard_count,
+            "concurrent_shards": concurrent_shards,
+            "shard_workers": shard_workers,
+            "assignments": balanced_shard_rows(
+                studies, shard_count, excluded_samples
+            ),
+            "max_failed_fraction": args.max_failed_fraction,
+            "max_failed_samples": args.max_failed_samples,
+        }
     return {
         "schema_version": SCHEMA_VERSION,
         "created_utc": utc_now(),
@@ -344,6 +564,14 @@ def build_manifest(
             for study in studies
         ],
         "metadata": file_fingerprint(metadata) if metadata else None,
+        "excluded_samples": (
+            {
+                "file": file_fingerprint(args.exclude_samples),
+                "sample_ids": sorted(excluded_samples),
+            }
+            if args.exclude_samples
+            else None
+        ),
         "color_by": list(args.color_by),
         "gg2_dir": str(args.gg2_dir),
         "gg2_artifacts": [
@@ -355,7 +583,13 @@ def build_manifest(
             "error_dist": args.error_dist,
             "min_reads": args.min_reads,
             "sampling_depth": args.sampling_depth,
+            "pcoa_method": args.pcoa_method,
+            "pcoa_dimensions": args.pcoa_dimensions,
         },
+        "deblur_scheduler": args.deblur_scheduler,
+        "balanced_deblur": balanced,
+        "pcoa_memory_budget_gb": args.pcoa_memory_budget_gb,
+        "export_distance_tsv": args.export_distance_tsv,
         "keep_deblur_tmp_files": args.keep_deblur_tmp_files,
     }
 
@@ -364,10 +598,15 @@ def compatibility_view(manifest: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "studies",
         "metadata",
+        "excluded_samples",
         "color_by",
         "gg2_dir",
         "gg2_artifacts",
         "scientific_parameters",
+        "deblur_scheduler",
+        "balanced_deblur",
+        "pcoa_memory_budget_gb",
+        "export_distance_tsv",
         "keep_deblur_tmp_files",
     )
     return {key: manifest.get(key) for key in keys}
@@ -395,15 +634,29 @@ def read_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def stage_output_paths(run_dir: Path, studies: list[Study], color_by: list[str]) -> dict[str, tuple[Path, ...]]:
+def stage_output_paths(
+    run_dir: Path,
+    studies: list[Study],
+    color_by: list[str],
+    deblur_scheduler: str = "study",
+) -> dict[str, tuple[Path, ...]]:
     outputs: dict[str, tuple[Path, ...]] = {}
-    for study in studies:
-        workflow_dir = run_dir / "work" / "deblur" / study.name / "workflow"
-        outputs[f"deblur:{study.name}"] = (
+    if deblur_scheduler == "balanced-shards":
+        workflow_dir = run_dir / "work" / "deblur-balanced" / "workflow"
+        outputs["deblur:balanced"] = (
             workflow_dir / "all.biom",
             workflow_dir / "all.seqs.fa",
+            run_dir / "results" / "sample_processing_status.tsv",
+            run_dir / "results" / "deblur_processing_summary.json",
         )
-    if len(studies) > 1:
+    else:
+        for study in studies:
+            workflow_dir = run_dir / "work" / "deblur" / study.name / "workflow"
+            outputs[f"deblur:{study.name}"] = (
+                workflow_dir / "all.biom",
+                workflow_dir / "all.seqs.fa",
+            )
+    if deblur_scheduler == "study" and len(studies) > 1:
         merged_dir = run_dir / "work" / "merged"
         outputs["merge"] = (merged_dir / "all.biom", merged_dir / "all.seqs.fa")
     results_dir = run_dir / "results"
@@ -421,44 +674,85 @@ def build_stages(
     repo_dir: Path,
 ) -> list[Stage]:
     run_dir = args.run_dir
-    output_paths = stage_output_paths(run_dir, studies, args.color_by)
+    output_paths = stage_output_paths(
+        run_dir, studies, args.color_by, args.deblur_scheduler
+    )
     stages: list[Stage] = []
     deblur_workflows: list[Path] = []
-    _, deblur_jobs_per_study = resolve_deblur_parallelism(args, len(studies))
-
-    for study in studies:
-        deblur_dir = run_dir / "work" / "deblur" / study.name
-        workflow_dir = deblur_dir / "workflow"
-        deblur_workflows.append(workflow_dir)
+    if args.deblur_scheduler == "balanced-shards":
+        shard_count, concurrent_shards, shard_workers = resolve_balanced_parallelism(
+            args, eligible_sample_count(args, studies)
+        )
+        balanced_dir = run_dir / "work" / "deblur-balanced"
         command = [
             sys.executable,
-            str(repo_dir / "src" / "run_deblur.py"),
-            "--data-dir",
-            str(study.fastq_dir),
+            str(repo_dir / "src" / "deblur_scheduler.py"),
+            "--shard-manifest",
+            str(balanced_dir / "shard_manifest.tsv"),
             "--work-dir",
-            str(deblur_dir),
+            str(balanced_dir),
+            "--results-dir",
+            str(run_dir / "results"),
             "--trim-length",
             str(args.trim_length),
             "--error-dist",
             args.error_dist,
             "--min-reads",
             str(args.min_reads),
-            "--jobs-to-start",
-            str(deblur_jobs_per_study),
+            "--shard-workers",
+            str(shard_workers),
+            "--concurrent-shards",
+            str(concurrent_shards),
+            "--max-failed-fraction",
+            str(args.max_failed_fraction),
             "--timings-tsv",
-            str(attempt_dir / f"deblur-{study.name}.tsv"),
+            str(attempt_dir / "deblur-balanced.tsv"),
         ]
+        if args.max_failed_samples is not None:
+            command.extend(("--max-failed-samples", str(args.max_failed_samples)))
         if args.keep_deblur_tmp_files:
             command.append("--keep-tmp-files")
         stages.append(
-            Stage(
-                f"deblur:{study.name}",
-                tuple(command),
-                output_paths[f"deblur:{study.name}"],
-            )
+            Stage("deblur:balanced", tuple(command), output_paths["deblur:balanced"])
         )
+        unifrac_input_dir = balanced_dir / "workflow"
+        unifrac_dependencies = ("deblur:balanced",)
+    else:
+        _, deblur_jobs_per_study = resolve_deblur_parallelism(args, len(studies))
 
-    if len(studies) > 1:
+        for study in studies:
+            deblur_dir = run_dir / "work" / "deblur" / study.name
+            workflow_dir = deblur_dir / "workflow"
+            deblur_workflows.append(workflow_dir)
+            command = [
+                sys.executable,
+                str(repo_dir / "src" / "run_deblur.py"),
+                "--data-dir",
+                str(study.fastq_dir),
+                "--work-dir",
+                str(deblur_dir),
+                "--trim-length",
+                str(args.trim_length),
+                "--error-dist",
+                args.error_dist,
+                "--min-reads",
+                str(args.min_reads),
+                "--jobs-to-start",
+                str(deblur_jobs_per_study),
+                "--timings-tsv",
+                str(attempt_dir / f"deblur-{study.name}.tsv"),
+            ]
+            if args.keep_deblur_tmp_files:
+                command.append("--keep-tmp-files")
+            stages.append(
+                Stage(
+                    f"deblur:{study.name}",
+                    tuple(command),
+                    output_paths[f"deblur:{study.name}"],
+                )
+            )
+
+    if args.deblur_scheduler == "study" and len(studies) > 1:
         merged_dir = run_dir / "work" / "merged"
         command = [
             sys.executable,
@@ -483,7 +777,7 @@ def build_stages(
         )
         unifrac_input_dir = merged_dir
         unifrac_dependencies = ("merge",)
-    else:
+    elif args.deblur_scheduler == "study":
         unifrac_input_dir = deblur_workflows[0]
         unifrac_dependencies = (f"deblur:{studies[0].name}",)
 
@@ -503,7 +797,15 @@ def build_stages(
         str(run_dir / "work" / "qiime2"),
         "--timings-tsv",
         str(attempt_dir / "unifrac.tsv"),
+        "--pcoa-method",
+        args.pcoa_method,
+        "--pcoa-dimensions",
+        str(args.pcoa_dimensions),
+        "--export-distance-tsv",
+        args.export_distance_tsv,
     ]
+    if args.pcoa_memory_budget_gb is not None:
+        command.extend(("--pcoa-memory-budget-gb", str(args.pcoa_memory_budget_gb)))
     if args.sampling_depth is not None:
         command.extend(("--sampling-depth", str(args.sampling_depth)))
     stages.append(
@@ -802,12 +1104,52 @@ def write_study_processing_status(
     return path
 
 
+def write_pipeline_summary(run_dir: Path, attempt_status: str) -> Path:
+    results_dir = run_dir / "results"
+    summary: dict[str, Any] = {"status": attempt_status}
+    deblur_summary = results_dir / "deblur_processing_summary.json"
+    analysis_summary = results_dir / "analysis_summary.json"
+    if deblur_summary.is_file():
+        summary["deblur"] = read_json(deblur_summary)
+    if analysis_summary.is_file():
+        summary["analysis"] = read_json(analysis_summary)
+    deblur_counts = summary.get("deblur", {}).get("counts", {})
+    analysis_counts = summary.get("analysis", {})
+    if deblur_counts:
+        summary["counts"] = {
+            "expected": deblur_counts.get("expected", 0),
+            "processed": sum(
+                deblur_counts.get(key, 0)
+                for key in ("completed", "completed_after_sanitation", "zero_features")
+            ),
+            "sanitized": deblur_counts.get("completed_after_sanitation", 0),
+            "zero_features": deblur_counts.get("zero_features", 0),
+            "failed": deblur_counts.get("failed", 0),
+            "excluded_assay": deblur_counts.get("excluded_assay", 0),
+            "mapped": analysis_counts.get("mapped_samples"),
+            "rarefied": analysis_counts.get("rarefied_samples"),
+        }
+    path = results_dir / "pipeline_summary.json"
+    write_json_atomic(path, summary)
+    return path
+
+
 def execute_pipeline(args: argparse.Namespace) -> Path:
     repo_dir = Path(__file__).resolve().parent.parent
     studies, metadata, executables = validate_args(args)
     manifest = build_manifest(args, studies, metadata, executables, repo_dir)
-    output_paths = stage_output_paths(args.run_dir, studies, args.color_by)
+    output_paths = stage_output_paths(
+        args.run_dir, studies, args.color_by, args.deblur_scheduler
+    )
     state, attempt_number = initialize_run(args, manifest, list(output_paths))
+
+    if args.deblur_scheduler == "balanced-shards":
+        balanced = manifest["balanced_deblur"]
+        assert isinstance(balanced, dict)
+        write_shard_manifest(
+            args.run_dir / "work" / "deblur-balanced" / "shard_manifest.tsv",
+            balanced["assignments"],
+        )
 
     attempt_dir = args.run_dir / "timings" / f"attempt-{attempt_number:03d}"
     while attempt_dir.exists():
@@ -817,18 +1159,31 @@ def execute_pipeline(args: argparse.Namespace) -> Path:
     stages = build_stages(args, studies, metadata, attempt_dir, repo_dir)
     state_path = args.run_dir / "run_state.json"
     current_commit, tracked_dirty = git_info(repo_dir)
-    deblur_study_workers, deblur_jobs_per_study = resolve_deblur_parallelism(
-        args, len(studies)
-    )
+    if args.deblur_scheduler == "study":
+        deblur_stage_workers, deblur_jobs_per_stage = resolve_deblur_parallelism(
+            args, len(studies)
+        )
+    else:
+        shard_count, concurrent_shards, shard_workers = resolve_balanced_parallelism(
+            args, eligible_sample_count(args, studies)
+        )
+        deblur_stage_workers = 1
+        deblur_jobs_per_stage = shard_workers
     attempt = {
         "number": attempt_number,
         "status": "running",
         "started_utc": utc_now(),
         "ended_utc": None,
         "threads": args.threads,
-        "deblur_study_workers": deblur_study_workers,
-        "deblur_jobs_per_study": deblur_jobs_per_study,
+        "deblur_scheduler": args.deblur_scheduler,
+        "deblur_study_workers": deblur_stage_workers if args.deblur_scheduler == "study" else None,
+        "deblur_jobs_per_study": deblur_jobs_per_stage if args.deblur_scheduler == "study" else None,
+        "deblur_shard_count": shard_count if args.deblur_scheduler == "balanced-shards" else None,
+        "deblur_concurrent_shards": concurrent_shards if args.deblur_scheduler == "balanced-shards" else None,
+        "deblur_shard_workers": deblur_jobs_per_stage if args.deblur_scheduler == "balanced-shards" else None,
         "max_failed_studies": args.max_failed_studies,
+        "max_failed_fraction": args.max_failed_fraction,
+        "max_failed_samples": args.max_failed_samples,
         "git_commit": current_commit,
         "git_tracked_dirty": tracked_dirty,
         "hostname": socket.gethostname(),
@@ -855,18 +1210,21 @@ def execute_pipeline(args: argparse.Namespace) -> Path:
                 state_path,
                 attempt_number,
                 timing,
-                deblur_study_workers,
+                deblur_stage_workers,
             )
             rerun_stages.update(rerun_deblur)
-            status_path = write_study_processing_status(args.run_dir, studies, state)
-            print(f"Study processing status: {status_path}", flush=True)
-            if len(failed_deblur) > args.max_failed_studies:
+            if args.deblur_scheduler == "study":
+                status_path = write_study_processing_status(args.run_dir, studies, state)
+                print(f"Study processing status: {status_path}", flush=True)
+            if args.deblur_scheduler == "study" and len(failed_deblur) > args.max_failed_studies:
                 names = ", ".join(sorted(failed_deblur))
                 raise RuntimeError(
                     f"{len(failed_deblur)} Deblur study stage(s) failed, exceeding "
                     f"--max-failed-studies={args.max_failed_studies}: {names}"
                 )
-            if failed_deblur:
+            if args.deblur_scheduler == "balanced-shards" and failed_deblur:
+                raise RuntimeError("Balanced Deblur scheduler failed; see its processing summary")
+            if args.deblur_scheduler == "study" and failed_deblur:
                 print(
                     f"Excluding {len(failed_deblur)} failed Deblur study stage(s) "
                     f"within configured limit: {', '.join(sorted(failed_deblur))}",
@@ -895,8 +1253,16 @@ def execute_pipeline(args: argparse.Namespace) -> Path:
         write_json_atomic(state_path, state)
         raise
 
-    attempt.update({"status": "completed", "ended_utc": utc_now()})
+    final_status = "completed"
+    deblur_summary_path = args.run_dir / "results" / "deblur_processing_summary.json"
+    if deblur_summary_path.is_file():
+        deblur_status = read_json(deblur_summary_path).get("status")
+        if deblur_status == "completed_with_exclusions":
+            final_status = "completed_with_exclusions"
+    attempt.update({"status": final_status, "ended_utc": utc_now()})
     write_json_atomic(state_path, state)
+    summary_path = write_pipeline_summary(args.run_dir, final_status)
+    print(f"Pipeline summary: {summary_path}", flush=True)
     print(f"Pipeline completed. Results: {args.run_dir / 'results'}", flush=True)
     return args.run_dir
 

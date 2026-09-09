@@ -10,6 +10,7 @@ import run_deblur
 from run_deblur import (
     discover_inputs,
     filter_invalid_fastq_records,
+    load_input_manifest,
     parse_args,
     run_deblur_workflow,
     stage_inputs_for_deblur,
@@ -85,6 +86,17 @@ def test_parse_args_parses_jobs_to_start(monkeypatch: pytest.MonkeyPatch) -> Non
     assert args.trim_length == 200
     assert args.min_reads == 0
     assert args.keep_tmp_files is False
+
+
+def test_load_input_manifest_reads_exact_fastq_paths(tmp_path: Path) -> None:
+    second = tmp_path / "B_1.fastq.gz"
+    first = tmp_path / "A_1.fastq.gz"
+    first.write_bytes(b"a")
+    second.write_bytes(b"b")
+    manifest = tmp_path / "inputs.txt"
+    manifest.write_text(f"# shard inputs\n{second}\n{first}\n")
+
+    assert load_input_manifest(manifest) == [first.resolve(), second.resolve()]
 
 
 def test_run_deblur_workflow_builds_expected_command(
