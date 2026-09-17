@@ -185,7 +185,7 @@ def test_split_marker_avoids_repeating_failed_parent_on_resume(
     assert parent_calls == 1
 
 
-def test_cache_is_reused_only_for_exact_fastq_membership(
+def test_cache_is_rejected_when_it_does_not_cover_current_membership(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     first = make_entry(tmp_path, "A", 10)
@@ -224,6 +224,41 @@ def test_cache_is_reused_only_for_exact_fastq_membership(
         "shard-0000", (first, second), args, TimingRecorder(None, "test")
     )
     assert calls == 1
+
+
+def test_cached_superset_is_reused_and_filtered_to_current_membership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = make_entry(tmp_path, "A", 10)
+    excluded = make_entry(tmp_path, "EXCLUDED", 10)
+    args = deblur_scheduler.parse_args(
+        [
+            "--shard-manifest",
+            str(tmp_path / "unused.tsv"),
+            "--work-dir",
+            str(tmp_path / "work"),
+            "--results-dir",
+            str(tmp_path / "results"),
+        ]
+    )
+    node_dir = tmp_path / "work" / "nodes" / "shard-0000"
+    write_workflow(node_dir, ["A", "EXCLUDED"])
+    deblur_scheduler.write_fastq_manifest(
+        node_dir / "fastqs.txt", (first, excluded)
+    )
+
+    def unexpected_run(*_: object, **__: object) -> None:
+        raise AssertionError("covered cache should not rerun Deblur")
+
+    monkeypatch.setattr(deblur_scheduler, "run_command", unexpected_run)
+    leaves = deblur_scheduler.run_node(
+        "shard-0000", (first,), args, TimingRecorder(None, "test")
+    )
+    observed = deblur_scheduler.merge_workflows(leaves, tmp_path / "merged")
+
+    assert observed == {"A_1"}
+    merged = biom.load_table(str(tmp_path / "merged" / "all.biom"))
+    assert list(merged.ids(axis="sample")) == ["A_1"]
 
 
 def test_timeout_splits_shard_and_records_singleton_timeout(

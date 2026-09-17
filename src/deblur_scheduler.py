@@ -168,8 +168,8 @@ def workflow_is_complete(workflow_dir: Path) -> bool:
     )
 
 
-def cached_workflow_matches(node_dir: Path, entries: tuple[FastqEntry, ...]) -> bool:
-    """Return whether cached outputs were produced from exactly these FASTQs."""
+def cached_workflow_covers(node_dir: Path, entries: tuple[FastqEntry, ...]) -> bool:
+    """Return whether cached outputs cover every currently requested FASTQ."""
     workflow_dir = node_dir / "workflow"
     manifest_path = node_dir / "fastqs.txt"
     if not workflow_is_complete(workflow_dir) or not manifest_path.is_file():
@@ -180,7 +180,7 @@ def cached_workflow_matches(node_dir: Path, entries: tuple[FastqEntry, ...]) -> 
         for line in manifest_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    return observed == expected
+    return len(observed) == len(set(observed)) and set(expected).issubset(observed)
 
 
 def write_fastq_manifest(path: Path, entries: tuple[FastqEntry, ...]) -> None:
@@ -196,18 +196,25 @@ def run_leaf(
 ) -> list[LeafResult]:
     node_dir = args.work_dir / "nodes" / node_id
     workflow_dir = node_dir / "workflow"
-    if cached_workflow_matches(node_dir, entries):
-        timing.skipped("deblur_shard", item=node_id, message="valid cached workflow")
+    if cached_workflow_covers(node_dir, entries):
+        timing.skipped(
+            "deblur_shard",
+            item=node_id,
+            message="valid cached workflow covering current membership",
+        )
         return [LeafResult(node_id, entries, workflow_dir)]
     split_marker = node_dir / "split.json"
     if split_marker.is_file():
         split = json.loads(split_marker.read_text(encoding="utf-8"))
         current_ids = {entry.sample_id for entry in entries}
-        if set(split["left"] + split["right"]) == current_ids:
+        split_ids = set(split["left"] + split["right"])
+        if current_ids.issubset(split_ids):
             by_id = {entry.sample_id: entry for entry in entries}
             results: list[LeafResult] = []
             for suffix, sample_ids in (("L", split["left"]), ("R", split["right"])):
-                child = tuple(by_id[sample_id] for sample_id in sample_ids)
+                child = tuple(
+                    by_id[sample_id] for sample_id in sample_ids if sample_id in by_id
+                )
                 if child:
                     results.extend(run_node(f"{node_id}-{suffix}", child, args, timing))
             return results
@@ -343,6 +350,19 @@ def merge_workflows(leaves: list[LeafResult], output_dir: Path) -> set[str]:
         if leaf.workflow_dir is None:
             continue
         table = biom.load_table(str(leaf.workflow_dir / "all.biom"))
+        expected_sample_ids = {
+            identifier
+            for entry in leaf.entries
+            for identifier in deblur_ids_for_entry(entry)
+        }
+        retained_table_ids = [
+            value
+            for value in table.ids(axis="sample")
+            if str(value) in expected_sample_ids
+        ]
+        if not retained_table_ids:
+            continue
+        table = table.filter(retained_table_ids, axis="sample", inplace=False)
         if table.shape == (0, 0):
             continue
         tables.append(table)
