@@ -185,6 +185,101 @@ def test_split_marker_avoids_repeating_failed_parent_on_resume(
     assert parent_calls == 1
 
 
+def test_cache_is_reused_only_for_exact_fastq_membership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = make_entry(tmp_path, "A", 10)
+    second = make_entry(tmp_path, "B", 10)
+    args = deblur_scheduler.parse_args(
+        [
+            "--shard-manifest",
+            str(tmp_path / "unused.tsv"),
+            "--work-dir",
+            str(tmp_path / "work"),
+            "--results-dir",
+            str(tmp_path / "results"),
+        ]
+    )
+    node_dir = tmp_path / "work" / "nodes" / "shard-0000"
+    write_workflow(node_dir, ["A"])
+    deblur_scheduler.write_fastq_manifest(node_dir / "fastqs.txt", (first,))
+    calls = 0
+
+    def fake_run_command(command: list[str], **_: object) -> None:
+        nonlocal calls
+        calls += 1
+        input_manifest = Path(command[command.index("--input-manifest") + 1])
+        sample_ids = [
+            Path(line).name.removesuffix("_1.fastq.gz")
+            for line in input_manifest.read_text().splitlines()
+        ]
+        write_workflow(Path(command[command.index("--work-dir") + 1]), sample_ids)
+
+    monkeypatch.setattr(deblur_scheduler, "run_command", fake_run_command)
+
+    deblur_scheduler.run_node("shard-0000", (first,), args, TimingRecorder(None, "test"))
+    assert calls == 0
+
+    deblur_scheduler.run_node(
+        "shard-0000", (first, second), args, TimingRecorder(None, "test")
+    )
+    assert calls == 1
+
+
+def test_timeout_splits_shard_and_records_singleton_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entries = [make_entry(tmp_path, sample_id, 10) for sample_id in ("GOOD", "SLOW")]
+    manifest = tmp_path / "shards.tsv"
+    write_manifest(manifest, entries)
+
+    def fake_run_command(command: list[str], **_: object) -> None:
+        input_manifest = Path(command[command.index("--input-manifest") + 1])
+        sample_ids = [
+            Path(line).name.removesuffix("_1.fastq.gz")
+            for line in input_manifest.read_text().splitlines()
+        ]
+        if len(sample_ids) > 1 or "SLOW" in sample_ids:
+            raise subprocess.TimeoutExpired(command, 1)
+        write_workflow(Path(command[command.index("--work-dir") + 1]), sample_ids)
+
+    monkeypatch.setattr(deblur_scheduler, "run_command", fake_run_command)
+    args = deblur_scheduler.parse_args(
+        [
+            "--shard-manifest",
+            str(manifest),
+            "--work-dir",
+            str(tmp_path / "work"),
+            "--results-dir",
+            str(tmp_path / "results"),
+            "--max-failed-samples",
+            "1",
+            "--shard-timeout-seconds",
+            "2",
+            "--singleton-timeout-seconds",
+            "1",
+        ]
+    )
+
+    assert deblur_scheduler.run(args, TimingRecorder(None, "test")) == 0
+    summary = json.loads(
+        (tmp_path / "results" / "deblur_processing_summary.json").read_text()
+    )
+    assert summary["counts"]["completed"] == 1
+    assert summary["counts"]["timed_out"] == 1
+    assert summary["status"] == "completed_with_exclusions"
+    status_rows = list(
+        csv.DictReader(
+            (tmp_path / "results" / "sample_processing_status.tsv").open(),
+            delimiter="\t",
+        )
+    )
+    assert {row["sample_id"]: row["status"] for row in status_rows} == {
+        "GOOD": "completed",
+        "SLOW": "timed_out",
+    }
+
+
 def test_scheduler_fails_fast_on_infrastructure_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

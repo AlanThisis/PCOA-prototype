@@ -342,6 +342,31 @@ def test_balanced_shards_use_lpt_weighting_and_all_threads(tmp_path: Path) -> No
     assert sorted(row["sample_id"] for row in rows) == ["A", "B", "C", "D"]
 
 
+def test_balanced_shards_isolate_large_fastqs(tmp_path: Path) -> None:
+    study = tmp_path / "study"
+    paths = [
+        write_fastq(study, sample_id)
+        for sample_id in ("SMALL1", "LARGE", "SMALL2")
+    ]
+    paths[0].write_bytes(b"x" * 10)
+    paths[1].write_bytes(b"x" * 300)
+    paths[2].write_bytes(b"x" * 20)
+    studies = run_pipeline.parse_studies([f"study={study}"])
+
+    rows = run_pipeline.balanced_shard_rows(
+        studies,
+        2,
+        singleton_threshold_bytes=300,
+    )
+
+    by_sample = {str(row["sample_id"]): row for row in rows}
+    assert by_sample["LARGE"]["shard_id"] == 2
+    assert {
+        by_sample["SMALL1"]["shard_id"],
+        by_sample["SMALL2"]["shard_id"],
+    } == {0, 1}
+
+
 def test_balanced_scheduler_is_default_and_bypasses_study_merge(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

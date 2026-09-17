@@ -58,6 +58,17 @@ def test_timed_command_records_failure_before_reraising(tmp_path: Path) -> None:
     assert row["command"]
 
 
+def test_run_command_times_out_and_terminates_process_group() -> None:
+    command = [sys.executable, "-c", "import time; time.sleep(60)"]
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_command(
+            command,
+            timeout_seconds=0.05,
+            terminate_process_group=True,
+        )
+
+
 def test_disabled_timing_recorder_does_not_write_a_file(tmp_path: Path) -> None:
     timing = TimingRecorder(None, component="test")
     with timing.step("operation"):

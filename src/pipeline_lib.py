@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -221,9 +223,49 @@ def run_command(
     item: str = "",
     stdout: object | None = None,
     stderr: object | None = None,
+    timeout_seconds: float | None = None,
+    terminate_process_group: bool = False,
 ) -> None:
+    def execute() -> None:
+        if not terminate_process_group:
+            subprocess.run(
+                args,
+                check=True,
+                cwd=cwd,
+                stdout=stdout,
+                stderr=stderr,
+                timeout=timeout_seconds,
+            )
+            return
+
+        process = subprocess.Popen(
+            args,
+            cwd=cwd,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
+        try:
+            return_code = process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            raise
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, args)
+
     if timing is not None and step is not None:
         with timing.step(step, item=item, command=shlex.join(args)):
-            subprocess.run(args, check=True, cwd=cwd, stdout=stdout, stderr=stderr)
+            execute()
         return
-    subprocess.run(args, check=True, cwd=cwd, stdout=stdout, stderr=stderr)
+    execute()

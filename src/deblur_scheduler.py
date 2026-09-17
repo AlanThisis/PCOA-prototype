@@ -48,6 +48,7 @@ class LeafResult:
     entries: tuple[FastqEntry, ...]
     workflow_dir: Path | None
     error: str | None = None
+    failure_kind: str | None = None
 
 
 class InfrastructureFailure(RuntimeError):
@@ -95,6 +96,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--concurrent-shards", type=int, default=1)
     parser.add_argument("--max-failed-fraction", type=float, default=0.02)
     parser.add_argument("--max-failed-samples", type=int)
+    parser.add_argument("--shard-timeout-seconds", type=float, default=8 * 60 * 60)
+    parser.add_argument("--singleton-timeout-seconds", type=float, default=90 * 60)
     parser.add_argument("--keep-tmp-files", action="store_true")
     add_timing_argument(parser)
     return parser.parse_args(argv)
@@ -165,6 +168,21 @@ def workflow_is_complete(workflow_dir: Path) -> bool:
     )
 
 
+def cached_workflow_matches(node_dir: Path, entries: tuple[FastqEntry, ...]) -> bool:
+    """Return whether cached outputs were produced from exactly these FASTQs."""
+    workflow_dir = node_dir / "workflow"
+    manifest_path = node_dir / "fastqs.txt"
+    if not workflow_is_complete(workflow_dir) or not manifest_path.is_file():
+        return False
+    expected = [str(entry.fastq_path) for entry in entries]
+    observed = [
+        line.strip()
+        for line in manifest_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    return observed == expected
+
+
 def write_fastq_manifest(path: Path, entries: tuple[FastqEntry, ...]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(f"{entry.fastq_path}\n" for entry in entries), encoding="utf-8")
@@ -178,7 +196,7 @@ def run_leaf(
 ) -> list[LeafResult]:
     node_dir = args.work_dir / "nodes" / node_id
     workflow_dir = node_dir / "workflow"
-    if workflow_is_complete(workflow_dir):
+    if cached_workflow_matches(node_dir, entries):
         timing.skipped("deblur_shard", item=node_id, message="valid cached workflow")
         return [LeafResult(node_id, entries, workflow_dir)]
     split_marker = node_dir / "split.json"
@@ -217,6 +235,11 @@ def run_leaf(
     if args.keep_tmp_files:
         command.append("--keep-tmp-files")
     log_path = node_dir / "deblur.log"
+    timeout_seconds = (
+        args.singleton_timeout_seconds
+        if len(entries) == 1
+        else args.shard_timeout_seconds
+    )
     try:
         with log_path.open("w", encoding="utf-8") as log_handle:
             run_command(
@@ -226,11 +249,18 @@ def run_leaf(
                 item=node_id,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
+                timeout_seconds=timeout_seconds,
+                terminate_process_group=True,
             )
         if not workflow_is_complete(workflow_dir):
             raise RuntimeError("Deblur returned without a complete workflow")
         return [LeafResult(node_id, entries, workflow_dir)]
-    except (subprocess.CalledProcessError, RuntimeError, OSError) as exc:
+    except (
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        RuntimeError,
+        OSError,
+    ) as exc:
         log_text = (
             log_path.read_text(encoding="utf-8", errors="replace")
             if log_path.is_file()
@@ -242,8 +272,16 @@ def run_leaf(
                 f"bisection. See {log_path}: {type(exc).__name__}: {exc}"
             ) from exc
         if len(entries) == 1:
+            failure_kind = (
+                "timed_out" if isinstance(exc, subprocess.TimeoutExpired) else "failed"
+            )
+            detail = (
+                f"Deblur exceeded {timeout_seconds:g} seconds"
+                if failure_kind == "timed_out"
+                else f"{type(exc).__name__}: {exc}"
+            )
             return [
-                LeafResult(node_id, entries, None, f"{type(exc).__name__}: {exc}")
+                LeafResult(node_id, entries, None, detail, failure_kind)
             ]
         left, right = split_entries(entries)
         write_json_atomic(
@@ -266,6 +304,7 @@ def asdict_leaf(result: LeafResult) -> dict[str, Any]:
         "sample_ids": [entry.sample_id for entry in result.entries],
         "workflow_dir": str(result.workflow_dir) if result.workflow_dir else None,
         "error": result.error,
+        "failure_kind": result.failure_kind,
     }
 
 
@@ -346,6 +385,7 @@ def write_sample_status(
         "completed_after_sanitation": 0,
         "zero_features": 0,
         "failed": 0,
+        "timed_out": 0,
         "excluded_assay": 0,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -363,7 +403,7 @@ def write_sample_status(
                 leaf = leaf_by_sample[entry.sample_id]
                 node_id = leaf.node_id
             if not entry.excluded_assay and leaf.workflow_dir is None:
-                status = "failed"
+                status = leaf.failure_kind or "failed"
                 message = leaf.error or "persistent Deblur failure"
             elif not entry.excluded_assay and any(
                 identifier in observed for identifier in deblur_ids_for_entry(entry)
@@ -400,6 +440,8 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
         raise ValueError("--max-failed-fraction must be between 0 and 1")
     if args.max_failed_samples is not None and args.max_failed_samples < 0:
         raise ValueError("--max-failed-samples cannot be negative")
+    if args.shard_timeout_seconds <= 0 or args.singleton_timeout_seconds <= 0:
+        raise ValueError("Deblur timeout values must be positive")
 
     args.work_dir = args.work_dir.resolve()
     args.results_dir = args.results_dir.resolve()
@@ -448,11 +490,12 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
         args.max_failed_fraction,
         args.max_failed_samples,
     )
+    runtime_failures = counts["failed"] + counts["timed_out"]
     if merge_error is not None:
         status = "failed_no_features"
-    elif counts["failed"] > failed_limit:
+    elif runtime_failures > failed_limit:
         status = "failed_tolerance_exceeded"
-    elif counts["failed"] or counts["zero_features"]:
+    elif runtime_failures or counts["zero_features"]:
         status = "completed_with_exclusions"
     else:
         status = "completed"
@@ -461,21 +504,23 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
         "counts": counts,
         "observed_deblur_sample_ids": len(observed),
         "failed_sample_limit": failed_limit,
-        "failure_fraction": counts["failed"]
+        "failure_fraction": runtime_failures
         / (counts["expected"] - counts["excluded_assay"]),
         "leaf_nodes": [asdict_leaf(leaf) for leaf in leaves],
     }
     write_json_atomic(args.results_dir / "deblur_processing_summary.json", summary)
     if merge_error is not None:
         raise merge_error
-    if counts["failed"] > failed_limit:
+    if runtime_failures > failed_limit:
         raise RuntimeError(
-            f"{counts['failed']} samples failed Deblur, exceeding allowed limit {failed_limit}"
+            f"{runtime_failures} samples failed or timed out in Deblur, "
+            f"exceeding allowed limit {failed_limit}"
         )
     print(
         f"Deblur complete: {counts['completed']} completed, "
         f"{counts['completed_after_sanitation']} sanitized, "
-        f"{counts['zero_features']} zero-feature, {counts['failed']} failed.",
+        f"{counts['zero_features']} zero-feature, {counts['failed']} failed, "
+        f"{counts['timed_out']} timed out.",
         flush=True,
     )
     return 0

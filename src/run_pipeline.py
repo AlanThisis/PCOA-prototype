@@ -111,6 +111,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Initial balanced shard count (default: 2 x --threads).",
     )
     parser.add_argument(
+        "--deblur-singleton-threshold-mb",
+        type=float,
+        help="Place FASTQs at or above this size into individual Deblur shards.",
+    )
+    parser.add_argument(
+        "--deblur-shard-timeout-seconds",
+        type=float,
+        default=8 * 60 * 60,
+        help="Timeout for a multi-sample Deblur shard (default: 28800).",
+    )
+    parser.add_argument(
+        "--deblur-singleton-timeout-seconds",
+        type=float,
+        default=90 * 60,
+        help="Timeout for a one-sample Deblur shard (default: 5400).",
+    )
+    parser.add_argument(
         "--deblur-study-workers",
         type=int,
         default=1,
@@ -321,6 +338,16 @@ def validate_args(
         raise ValueError("--deblur-shard-workers must be greater than zero")
     if args.deblur_shard_count is not None and args.deblur_shard_count <= 0:
         raise ValueError("--deblur-shard-count must be greater than zero")
+    if (
+        args.deblur_singleton_threshold_mb is not None
+        and args.deblur_singleton_threshold_mb <= 0
+    ):
+        raise ValueError("--deblur-singleton-threshold-mb must be greater than zero")
+    if (
+        args.deblur_shard_timeout_seconds <= 0
+        or args.deblur_singleton_timeout_seconds <= 0
+    ):
+        raise ValueError("Deblur timeout values must be greater than zero")
     if not 0 <= args.max_failed_fraction <= 1:
         raise ValueError("--max-failed-fraction must be between zero and one")
     if args.max_failed_samples is not None and args.max_failed_samples < 0:
@@ -431,7 +458,10 @@ def eligible_sample_count(args: argparse.Namespace, studies: list[Study]) -> int
 
 
 def balanced_shard_rows(
-    studies: list[Study], shard_count: int, excluded_samples: set[str] | None = None
+    studies: list[Study],
+    shard_count: int,
+    excluded_samples: set[str] | None = None,
+    singleton_threshold_bytes: int | None = None,
 ) -> list[dict[str, str | int]]:
     excluded_samples = excluded_samples or set()
     paths = [path for study in studies for path in study.fastq_paths]
@@ -447,14 +477,26 @@ def balanced_shard_rows(
         for study in studies
         for path in study.fastq_paths
     ]
+    ordinary = [
+        item
+        for item in weighted
+        if singleton_threshold_bytes is None or item[4] < singleton_threshold_bytes
+    ]
+    singletons = [
+        item
+        for item in weighted
+        if singleton_threshold_bytes is not None and item[4] >= singleton_threshold_bytes
+    ]
     totals = [0] * shard_count
     rows: list[dict[str, str | int]] = []
     for weight, sample_id, study_name, path, size in sorted(
-        weighted, key=lambda item: (-item[0], item[1], item[2])
+        ordinary, key=lambda item: (-item[0], item[1], item[2])
     ):
         excluded = sample_id in excluded_samples
-        shard_id = -1 if excluded else min(
-            range(shard_count), key=lambda index: (totals[index], index)
+        shard_id = (
+            -1
+            if excluded
+            else min(range(shard_count), key=lambda index: (totals[index], index))
         )
         if not excluded:
             totals[shard_id] += weight
@@ -469,6 +511,25 @@ def balanced_shard_rows(
                 "excluded_assay": int(excluded),
             }
         )
+
+    next_shard_id = shard_count
+    for weight, sample_id, study_name, path, size in sorted(
+        singletons, key=lambda item: (item[1], item[2])
+    ):
+        excluded = sample_id in excluded_samples
+        rows.append(
+            {
+                "sample_id": sample_id,
+                "study": study_name,
+                "fastq_path": str(path),
+                "size_bytes": size,
+                "weight_bytes": weight,
+                "shard_id": -1 if excluded else next_shard_id,
+                "excluded_assay": int(excluded),
+            }
+        )
+        if not excluded:
+            next_shard_id += 1
     return sorted(rows, key=lambda row: (int(row["shard_id"]), str(row["sample_id"])))
 
 
@@ -539,10 +600,19 @@ def build_manifest(
             "concurrent_shards": concurrent_shards,
             "shard_workers": shard_workers,
             "assignments": balanced_shard_rows(
-                studies, shard_count, excluded_samples
+                studies,
+                shard_count,
+                excluded_samples,
+                (
+                    int(args.deblur_singleton_threshold_mb * 1_000_000)
+                    if args.deblur_singleton_threshold_mb is not None
+                    else None
+                ),
             ),
             "max_failed_fraction": args.max_failed_fraction,
             "max_failed_samples": args.max_failed_samples,
+            "shard_timeout_seconds": args.deblur_shard_timeout_seconds,
+            "singleton_timeout_seconds": args.deblur_singleton_timeout_seconds,
         }
     return {
         "schema_version": SCHEMA_VERSION,
@@ -705,6 +775,10 @@ def build_stages(
             str(concurrent_shards),
             "--max-failed-fraction",
             str(args.max_failed_fraction),
+            "--shard-timeout-seconds",
+            str(args.deblur_shard_timeout_seconds),
+            "--singleton-timeout-seconds",
+            str(args.deblur_singleton_timeout_seconds),
             "--timings-tsv",
             str(attempt_dir / "deblur-balanced.tsv"),
         ]
@@ -1125,6 +1199,7 @@ def write_pipeline_summary(run_dir: Path, attempt_status: str) -> Path:
             "sanitized": deblur_counts.get("completed_after_sanitation", 0),
             "zero_features": deblur_counts.get("zero_features", 0),
             "failed": deblur_counts.get("failed", 0),
+            "timed_out": deblur_counts.get("timed_out", 0),
             "excluded_assay": deblur_counts.get("excluded_assay", 0),
             "mapped": analysis_counts.get("mapped_samples"),
             "rarefied": analysis_counts.get("rarefied_samples"),
