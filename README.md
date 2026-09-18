@@ -263,6 +263,48 @@ Deblur.
 
 `unifrac.py` uses GG2's `non-v4-16s` closed-reference action (vsearch at 99%) to map Deblur ASVs onto the GG2 backbone, then computes UniFrac against the GG2 ID phylogeny. Rarefaction depth defaults to 1,000 reads after backbone mapping; override with `--sampling-depth`.
 
+### Faith's PD alpha rarefaction
+
+Generate an alpha-rarefaction diagnostic directly from a completed GG2 mapping,
+without rerunning Deblur, GG2 mapping, UniFrac, or PCoA:
+
+```bash
+python src/alpha_rarefaction.py run \
+  --mapped-table runs/example/work/qiime2/backbone-mapped-table.qza \
+  --phylogeny data/gg2/2024.09.phylogeny.id.nwk.qza \
+  --metadata data/metadata.tsv \
+  --output-dir results/example/alpha_rarefaction \
+  --reference-depth 1000
+```
+
+The script runs `qiime diversity alpha-rarefaction` with Faith's PD and writes
+the interactive QZV, per-sample mapped depths, sample retention at each tested
+depth, and a JSON summary. Automatic maximum depth uses the mapped-table 90th
+percentile while including the reference depth when possible. Pass
+`--max-depth` to use the same explicit x-axis across related datasets.
+
+After running related levels on the same depth grid, combine their static
+summaries without rerunning QIIME 2:
+
+```bash
+python src/alpha_rarefaction.py compare \
+  --curve Full=results/full/alpha_rarefaction/faith_pd_curve_summary.tsv \
+  --curve 50%=results/sub50/alpha_rarefaction/faith_pd_curve_summary.tsv \
+  --curve 25%=results/sub25/alpha_rarefaction/faith_pd_curve_summary.tsv \
+  --curve 10%=results/sub10/alpha_rarefaction/faith_pd_curve_summary.tsv \
+  --output results/tier1_faith_pd_alpha_rarefaction.png
+```
+
+An existing QZV that was generated with metadata can also be replotted by an
+embedded categorical column without rerunning QIIME 2:
+
+```bash
+python src/alpha_rarefaction.py group-plot \
+  --qzv results/full/alpha_rarefaction/faith_pd_alpha_rarefaction.qzv \
+  --metadata-column environment_harmonized \
+  --output results/full/alpha_rarefaction/faith_pd_by_sampling_site.png
+```
+
 PCoA defaults to `--pcoa-method auto`. It estimates exact eigendecomposition
 memory as `72 × samples²` bytes after rarefaction. Exact PCoA is used when the
 estimate fits within 80% of `--pcoa-memory-budget-gb`, the SLURM memory
@@ -321,6 +363,7 @@ examples, environment overrides, and monitoring commands.
 | `src/deblur_scheduler.py` | QIIME2 + repo extras | Balance Deblur shards and isolate sample-level failures |
 | `src/merge_biom.py` | QIIME2 + repo extras | Merge BIOM tables across studies |
 | `src/unifrac.py` | QIIME2 + repo extras | UniFrac PCoA via GG2 and QIIME2 |
+| `src/alpha_rarefaction.py` | QIIME2 + repo extras | Faith's PD alpha-rarefaction from an existing GG2-mapped table |
 | `src/plot_pcoa.py` | QIIME2 + repo extras | Plot PCoA coordinates colored by metadata |
 | `src/validate_pipeline_run.py` | Python | Validate terminal state and required outputs |
 | `src/get_ENA_metadata.py` | QIIME2 + repo extras | Fetch sample metadata CSV for an ENA project |
