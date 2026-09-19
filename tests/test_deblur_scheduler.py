@@ -261,6 +261,43 @@ def test_cached_superset_is_reused_and_filtered_to_current_membership(
     assert list(merged.ids(axis="sample")) == ["A_1"]
 
 
+def test_merge_workflows_prunes_features_emptied_by_sample_filtering(
+    tmp_path: Path,
+) -> None:
+    retained = make_entry(tmp_path, "A", 10)
+    make_entry(tmp_path, "EXCLUDED", 10)
+    workflow = tmp_path / "leaf" / "workflow"
+    workflow.mkdir(parents=True)
+    table = biom.Table(
+        np.array([[7, 0], [0, 11]]),
+        observation_ids=["retained-feature", "orphan-feature"],
+        sample_ids=["A_1", "EXCLUDED_1"],
+        input_is_dense=True,
+    )
+    with biom.util.biom_open(str(workflow / "all.biom"), "w") as handle:
+        table.to_hdf5(handle, "test")
+    (workflow / "all.seqs.fa").write_text(
+        ">retained-feature\nACGT\n>orphan-feature\nTGCA\n",
+        encoding="utf-8",
+    )
+    leaf = deblur_scheduler.LeafResult(
+        node_id="shard-0000",
+        entries=(retained,),
+        workflow_dir=workflow,
+    )
+
+    observed = deblur_scheduler.merge_workflows([leaf], tmp_path / "merged")
+
+    assert observed == {"A_1"}
+    merged = biom.load_table(str(tmp_path / "merged" / "all.biom"))
+    assert list(merged.ids(axis="sample")) == ["A_1"]
+    assert list(merged.ids(axis="observation")) == ["retained-feature"]
+    assert merged.sum(axis="sample").tolist() == [7]
+    assert (tmp_path / "merged" / "all.seqs.fa").read_text() == (
+        ">retained-feature\nACGT\n"
+    )
+
+
 def test_timeout_splits_shard_and_records_singleton_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

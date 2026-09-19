@@ -342,6 +342,21 @@ def sanitation_samples(workflow_dir: Path, entries: tuple[FastqEntry, ...]) -> s
         }
 
 
+def remove_empty_observations(table: biom.Table) -> tuple[biom.Table, int]:
+    """Drop zero-sum features without changing samples or sample depths."""
+    sample_ids = tuple(str(value) for value in table.ids(axis="sample"))
+    sample_depths = tuple(table.sum(axis="sample").tolist())
+    feature_count = table.shape[0]
+    cleaned = table.remove_empty(axis="observation", inplace=False)
+    if tuple(str(value) for value in cleaned.ids(axis="sample")) != sample_ids:
+        raise RuntimeError("Removing empty observations changed sample IDs")
+    if tuple(cleaned.sum(axis="sample").tolist()) != sample_depths:
+        raise RuntimeError("Removing empty observations changed sample depths")
+    if (cleaned.sum(axis="observation") <= 0).any():
+        raise RuntimeError("Feature table still contains zero-abundance observations")
+    return cleaned, feature_count - cleaned.shape[0]
+
+
 def merge_workflows(leaves: list[LeafResult], output_dir: Path) -> set[str]:
     tables = []
     sequences: dict[str, str] = {}
@@ -363,6 +378,11 @@ def merge_workflows(leaves: list[LeafResult], output_dir: Path) -> set[str]:
         if not retained_table_ids:
             continue
         table = table.filter(retained_table_ids, axis="sample", inplace=False)
+        table, removed = remove_empty_observations(table)
+        if removed:
+            print(
+                f"  {leaf.node_id}: removed {removed:,} zero-abundance features"
+            )
         if table.shape == (0, 0):
             continue
         tables.append(table)
@@ -373,10 +393,19 @@ def merge_workflows(leaves: list[LeafResult], output_dir: Path) -> set[str]:
     merged = tables[0]
     for table in tables[1:]:
         merged = merged.merge(table)
+    merged, removed = remove_empty_observations(merged)
+    if removed:
+        print(f"  merged: removed {removed:,} zero-abundance features")
     output_dir.mkdir(parents=True, exist_ok=True)
     with biom.util.biom_open(str(output_dir / "all.biom"), "w") as handle:
         merged.to_hdf5(handle, "deblur_scheduler.py")
     feature_ids = set(str(value) for value in merged.ids(axis="observation"))
+    missing_sequences = feature_ids.difference(sequences)
+    if missing_sequences:
+        raise ValueError(
+            f"Representative sequences are missing for {len(missing_sequences):,} "
+            f"nonzero features; examples: {sorted(missing_sequences)[:10]}"
+        )
     with (output_dir / "all.seqs.fa").open("w", encoding="utf-8") as handle:
         for sequence_id in sorted(feature_ids):
             if sequence_id in sequences:

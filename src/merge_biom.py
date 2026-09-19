@@ -53,6 +53,21 @@ def load_seqs(fa_fp: Path) -> dict[str, str]:
     return seqs
 
 
+def remove_empty_observations(table: biom.Table) -> tuple[biom.Table, int]:
+    """Drop zero-sum features while proving samples and depths are unchanged."""
+    sample_ids = tuple(str(value) for value in table.ids(axis="sample"))
+    sample_depths = tuple(table.sum(axis="sample").tolist())
+    feature_count = table.shape[0]
+    cleaned = table.remove_empty(axis="observation", inplace=False)
+    if tuple(str(value) for value in cleaned.ids(axis="sample")) != sample_ids:
+        raise RuntimeError("Removing empty observations changed sample IDs")
+    if tuple(cleaned.sum(axis="sample").tolist()) != sample_depths:
+        raise RuntimeError("Removing empty observations changed sample depths")
+    if (cleaned.sum(axis="observation") <= 0).any():
+        raise RuntimeError("Feature table still contains zero-abundance observations")
+    return cleaned, feature_count - cleaned.shape[0]
+
+
 def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
     args.out_dir = args.out_dir.resolve()
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -106,8 +121,14 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
         merged = tables[0]
         for t in tables[1:]:
             merged = merged.merge(t)
+        merged, removed_features = remove_empty_observations(merged)
 
     print(f"Merged: {merged.shape[1]} samples, {merged.shape[0]} features")
+    if removed_features:
+        print(
+            f"Removed {removed_features:,} zero-abundance features; "
+            "sample IDs and depths unchanged"
+        )
 
     out_biom = args.out_dir / "all.biom"
     with timing.step("write_merged_biom", item=str(out_biom)):
@@ -118,6 +139,13 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
     out_fa = args.out_dir / "all.seqs.fa"
     with timing.step("write_representative_sequences", item=str(out_fa)):
         feature_ids = set(merged.ids(axis="observation"))
+        missing_sequences = feature_ids.difference(all_seqs)
+        if missing_sequences:
+            raise ValueError(
+                f"Representative sequences are missing for "
+                f"{len(missing_sequences):,} nonzero features; examples: "
+                f"{sorted(missing_sequences)[:10]}"
+            )
         with out_fa.open("w") as f:
             for seq_id, seq in all_seqs.items():
                 if seq_id in feature_ids:
