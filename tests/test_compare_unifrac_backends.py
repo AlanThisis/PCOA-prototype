@@ -17,9 +17,14 @@ def write_distance(path: Path, ids: list[str], matrix: np.ndarray) -> None:
             handle.write(sample_id + "\t" + "\t".join(map(str, row)) + "\n")
 
 
-def write_ordination(path: Path, ids: list[str], matrix: np.ndarray) -> None:
+def write_ordination(
+    path: Path, ids: list[str], matrix: np.ndarray, method: str = "eigh"
+) -> None:
+    if method == "fsvd":
+        np.random.seed(0)
     result = skbio.stats.ordination.pcoa(
         skbio.DistanceMatrix(matrix, ids=ids),
+        method=method,
         number_of_dimensions=min(3, len(ids) - 1),
     )
     result.write(str(path), format="ordination")
@@ -42,7 +47,7 @@ def test_identical_backends_pass_all_acceptance_gates(tmp_path: Path) -> None:
     qiime_ord = tmp_path / "qiime-ordination.txt"
     dart_ord = tmp_path / "dart-ordination.txt"
     write_ordination(qiime_ord, ids, matrix)
-    write_ordination(dart_ord, ids, matrix)
+    write_ordination(dart_ord, ids, matrix, method="fsvd")
     out_dir = tmp_path / "comparison"
     args = argparse.Namespace(
         qiime_distance=qiime_dm,

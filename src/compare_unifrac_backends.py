@@ -160,6 +160,23 @@ def exact_pcoa(matrix: np.ndarray, ids: list[str], dimensions: int) -> np.ndarra
     return result.samples.to_numpy(dtype=float)
 
 
+def fsvd_pcoa(
+    matrix: np.ndarray, ids: list[str], dimensions: int, seed: int
+) -> np.ndarray:
+    """Run the seeded scikit-bio FSVD reference used by DART's validation."""
+    state = np.random.get_state()
+    np.random.seed(seed)
+    try:
+        result = skbio.stats.ordination.pcoa(
+            skbio.DistanceMatrix(matrix, ids=ids),
+            method="fsvd",
+            number_of_dimensions=min(dimensions, len(ids) - 1),
+        )
+    finally:
+        np.random.set_state(state)
+    return result.samples.to_numpy(dtype=float)
+
+
 def procrustes_test(
     reference: np.ndarray,
     candidate: np.ndarray,
@@ -218,6 +235,7 @@ def run(args: argparse.Namespace) -> int:
 
     exact_qiime = exact_pcoa(qiime_dm, ids, args.dimensions)
     exact_dart = exact_pcoa(dart_dm, ids, args.dimensions)
+    fsvd_dart = fsvd_pcoa(dart_dm, ids, args.dimensions, args.seed)
     qiime_coords = ordination_coordinates(args.qiime_ordination, ids, args.dimensions)
     dart_coords = ordination_coordinates(args.dart_ordination, ids, args.dimensions)
     full_matrix_compared = counts["total"] == counts["compared"]
@@ -230,7 +248,7 @@ def run(args: argparse.Namespace) -> int:
         ),
         "dart_fpcoa_only": (
             procrustes_test(
-                exact_dart,
+                fsvd_dart,
                 dart_coords,
                 permutations=args.permutations,
                 seed=args.seed + 1,
