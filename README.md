@@ -326,8 +326,8 @@ not fit the configured or detected memory budget.
 For backend acceptance testing, `src/compare_unifrac_backends.py` compares exact
 QIIME2 and DART distance matrices plus both ordinations. It validates sample
 IDs, symmetry, diagonals, Pearson/Spearman correlation, RMSE, and 10-axis
-Procrustes fits (including a seeded scikit-bio FSVD reference matching the DART
-paper), and exits nonzero when the configured project gates are not met.
+Procrustes fits against exact eigendecomposition, and exits nonzero when the
+configured project gates are not met.
 
 ### Resume a Failed Run
 
