@@ -25,7 +25,9 @@ def write_ordination(path: Path, ids: list[str], matrix: np.ndarray) -> None:
     result.write(str(path), format="ordination")
 
 
-def test_identical_backends_pass_all_acceptance_gates(tmp_path: Path) -> None:
+def test_identical_backends_report_metrics_without_acceptance_policy(
+    tmp_path: Path,
+) -> None:
     ids = ["a", "b", "c", "d"]
     matrix = np.array(
         [
@@ -59,10 +61,61 @@ def test_identical_backends_pass_all_acceptance_gates(tmp_path: Path) -> None:
 
     assert compare.run(args) == 0
     summary = json.loads((out_dir / "comparison_summary.json").read_text())
-    assert summary["passed"] is True
+    assert "thresholds" not in summary
+    assert "gates" not in summary
+    assert "passed" not in summary
     assert summary["distance_metrics"]["rmse"] == 0
     assert summary["procrustes"]["distance_only"]["m2"] < 1e-12
     assert summary["procrustes"]["dart_fpcoa_only"]["m2"] < 1e-12
+
+
+def test_metric_values_do_not_control_exit_status(tmp_path: Path) -> None:
+    ids = ["a", "b", "c", "d"]
+    qiime_matrix = np.array(
+        [
+            [0.0, 0.1, 0.2, 0.4],
+            [0.1, 0.0, 0.25, 0.35],
+            [0.2, 0.25, 0.0, 0.3],
+            [0.4, 0.35, 0.3, 0.0],
+        ]
+    )
+    dart_matrix = np.array(
+        [
+            [0.0, 0.9, 0.8, 0.1],
+            [0.9, 0.0, 0.7, 0.2],
+            [0.8, 0.7, 0.0, 0.6],
+            [0.1, 0.2, 0.6, 0.0],
+        ]
+    )
+    qiime_dm = tmp_path / "qiime.tsv"
+    dart_dm = tmp_path / "dart.tsv"
+    write_distance(qiime_dm, ids, qiime_matrix)
+    write_distance(dart_dm, ids, dart_matrix)
+    qiime_ord = tmp_path / "qiime-ordination.txt"
+    dart_ord = tmp_path / "dart-ordination.txt"
+    write_ordination(qiime_ord, ids, qiime_matrix)
+    write_ordination(dart_ord, ids, dart_matrix)
+    out_dir = tmp_path / "comparison"
+
+    assert (
+        compare.run(
+            argparse.Namespace(
+                qiime_distance=qiime_dm,
+                dart_distance=dart_dm,
+                qiime_ordination=qiime_ord,
+                dart_exact_ordination=dart_ord,
+                dart_ordination=dart_ord,
+                out_dir=out_dir,
+                dimensions=3,
+                permutations=0,
+                seed=0,
+                spearman_pairs=0,
+            )
+        )
+        == 0
+    )
+    summary = json.loads((out_dir / "comparison_summary.json").read_text())
+    assert summary["distance_metrics"]["rmse"] > 0.1
 
 
 def test_distance_comparison_rejects_mismatched_ids(tmp_path: Path) -> None:

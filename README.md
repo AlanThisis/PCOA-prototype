@@ -323,7 +323,7 @@ retains the earlier behavior: it estimates exact eigendecomposition memory as
 `72 × samples²` bytes and switches to QIIME2 FSVD when the exact estimate does
 not fit the configured or detected memory budget.
 
-For backend acceptance testing, `src/compare_unifrac_backends.py` compares exact
+For backend comparison, `src/compare_unifrac_backends.py` compares exact
 QIIME2 and DART results following the DartUniFrac paper's validation layers.
 Pearson correlation and RMSE stream over every distance pair; Spearman uses all
 pairs when feasible or a disclosed uniform pair sample at repository scale.
@@ -331,8 +331,9 @@ Three 10-axis Procrustes fits are reported separately: exact-QIIME versus
 exact-DART PCoA (distance approximation), exact-DART PCoA versus DART fPCoA
 (ordination approximation), and the end-to-end comparison. Large analyses must
 provide an exact `eigh` ordination computed from the DART distance matrix with
-`--dart-exact-ordination`. The command exits nonzero when configured acceptance
-gates are not met.
+`--dart-exact-ordination`. The script reports measurements without imposing
+acceptance thresholds. It exits nonzero only for invalid inputs or computation
+failures; interpretation of the metrics remains with the user.
 
 ### Resume a Failed Run
 
@@ -384,7 +385,7 @@ examples, environment overrides, and monitoring commands.
 | `src/merge_biom.py` | QIIME2 + repo extras | Merge BIOM tables across studies |
 | `src/unifrac.py` | QIIME2 + external DART | GG2 mapping/rarefaction plus DART (default) or QIIME UniFrac PCoA |
 | `src/dart_unifrac.py` | QIIME2 + external DART | Extract validated DART inputs and execute the DART backend |
-| `src/compare_unifrac_backends.py` | QIIME2 + scipy | Quantitative DART-versus-QIIME acceptance comparison |
+| `src/compare_unifrac_backends.py` | QIIME2 + scipy | Quantitative DART-versus-QIIME comparison without policy thresholds |
 | `src/alpha_rarefaction.py` | QIIME2 + repo extras | Faith's PD alpha-rarefaction from an existing GG2-mapped table |
 | `src/plot_pcoa.py` | QIIME2 + repo extras | Plot PCoA coordinates colored by metadata |
 | `src/validate_pipeline_run.py` | Python | Validate terminal state and required outputs |

@@ -419,26 +419,6 @@ def run(args: argparse.Namespace) -> int:
             seed=args.seed + 2,
         ),
     }
-    thresholds = {
-        "pearson_minimum": 0.98,
-        "spearman_minimum": 0.98,
-        "rmse_maximum": 0.03,
-        "distance_procrustes_m2_maximum": 0.02,
-        "fpcoa_procrustes_m2_maximum": 0.001,
-    }
-    gates = {
-        "pearson": distance_metrics["pearson"] >= thresholds["pearson_minimum"],
-        "spearman": distance_metrics["spearman"] >= thresholds["spearman_minimum"],
-        "rmse": distance_metrics["rmse"] <= thresholds["rmse_maximum"],
-        "distance_procrustes": (
-            procrustes_metrics["distance_only"]["m2"]
-            <= thresholds["distance_procrustes_m2_maximum"]
-        ),
-        "fpcoa_procrustes": (
-            procrustes_metrics["dart_fpcoa_only"]["m2"]
-            <= thresholds["fpcoa_procrustes_m2_maximum"]
-        ),
-    }
     summary = {
         "sample_counts": {
             "total": distance_metrics["sample_count"],
@@ -446,9 +426,6 @@ def run(args: argparse.Namespace) -> int:
         },
         "distance_metrics": distance_metrics,
         "procrustes": procrustes_metrics,
-        "thresholds": thresholds,
-        "gates": gates,
-        "passed": all(value for value in gates.values() if value is not None),
     }
     with (args.out_dir / "comparison_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True)
@@ -481,7 +458,7 @@ def run(args: argparse.Namespace) -> int:
     fig.tight_layout()
     fig.savefig(args.out_dir / "distance_comparison.png", dpi=180)
     plt.close(fig)
-    return 0 if summary["passed"] else 1
+    return 0
 
 
 def main() -> int:
