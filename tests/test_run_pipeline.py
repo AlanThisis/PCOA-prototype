@@ -46,6 +46,7 @@ def install_fake_environment(
     )
     monkeypatch.setattr(run_pipeline, "git_info", lambda _: ("abc123", False))
     monkeypatch.setattr(run_pipeline, "validate_qiime_gg2", lambda _: None)
+    monkeypatch.setattr(run_pipeline, "dart_version", lambda _: "dartunifrac 0.3.0")
 
     def fake_run_command(command: list[str], **_: object) -> None:
         commands.append(command)

@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from dart_unifrac import dart_version
+
 from pipeline_lib import TimingRecorder, discover_inputs, resolve_executable, run_command
 SCHEMA_VERSION = 1
 STUDY_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -164,6 +166,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-failed-samples",
         type=int,
         help="Absolute failed-sample limit; overrides --max-failed-fraction.",
+    )
+    parser.add_argument(
+        "--unifrac-engine",
+        choices=("dart", "qiime"),
+        default="dart",
+        help="UniFrac/PCoA backend after QIIME GG2 mapping and rarefaction (default: dart).",
+    )
+    parser.add_argument(
+        "--dartunifrac-executable",
+        default="dartunifrac",
+        help="DartUniFrac executable name or path (default: dartunifrac).",
+    )
+    parser.add_argument("--dart-sketch-size", type=int, default=2048)
+    parser.add_argument("--dart-seed", type=int, default=1337)
+    parser.add_argument(
+        "--dart-bbits", type=int, choices=(16, 32, 64), default=16
     )
     parser.add_argument(
         "--pcoa-method",
@@ -356,6 +374,20 @@ def validate_args(
         raise ValueError("--pcoa-dimensions must be at least two")
     if args.pcoa_memory_budget_gb is not None and args.pcoa_memory_budget_gb <= 0:
         raise ValueError("--pcoa-memory-budget-gb must be greater than zero")
+    if args.dart_sketch_size <= 0:
+        raise ValueError("--dart-sketch-size must be greater than zero")
+    if args.dart_seed < 0:
+        raise ValueError("--dart-seed cannot be negative")
+    if args.unifrac_engine == "dart":
+        if args.pcoa_method != "auto":
+            raise ValueError(
+                "--pcoa-method applies to the QIIME backend; use 'auto' with DART"
+            )
+        if args.pcoa_dimensions != 10:
+            raise ValueError(
+                "DartUniFrac v0.3.0 emits 10 fPCoA dimensions; "
+                "set --pcoa-dimensions 10"
+            )
     if args.deblur_scheduler == "balanced-shards" and args.min_reads != 0:
         raise ValueError("Balanced Deblur scheduling requires --min-reads 0")
     if not args.error_dist.strip():
@@ -409,6 +441,14 @@ def validate_args(
         "deblur": resolve_executable("deblur"),
         "qiime": resolve_executable("qiime"),
     }
+    if args.unifrac_engine == "dart":
+        executables["dartunifrac"] = resolve_executable(
+            args.dartunifrac_executable
+        )
+        args.dart_version = dart_version(executables["dartunifrac"])
+        args.dartunifrac_executable = executables["dartunifrac"]
+    else:
+        args.dart_version = None
     validate_qiime_gg2(executables["qiime"])
     args.run_dir = args.run_dir.expanduser().resolve()
     args.gg2_dir = gg2_dir
@@ -655,6 +695,12 @@ def build_manifest(
             "sampling_depth": args.sampling_depth,
             "pcoa_method": args.pcoa_method,
             "pcoa_dimensions": args.pcoa_dimensions,
+            "unifrac_engine": args.unifrac_engine,
+            "dart_method": "dmh" if args.unifrac_engine == "dart" else None,
+            "dart_sketch_size": args.dart_sketch_size,
+            "dart_seed": args.dart_seed,
+            "dart_bbits": args.dart_bbits,
+            "dart_version": args.dart_version,
         },
         "deblur_scheduler": args.deblur_scheduler,
         "balanced_deblur": balanced,
@@ -877,7 +923,22 @@ def build_stages(
         str(args.pcoa_dimensions),
         "--export-distance-tsv",
         args.export_distance_tsv,
+        "--unifrac-engine",
+        args.unifrac_engine,
     ]
+    if args.unifrac_engine == "dart":
+        command.extend(
+            (
+                "--dartunifrac-executable",
+                args.dartunifrac_executable,
+                "--dart-sketch-size",
+                str(args.dart_sketch_size),
+                "--dart-seed",
+                str(args.dart_seed),
+                "--dart-bbits",
+                str(args.dart_bbits),
+            )
+        )
     if args.pcoa_memory_budget_gb is not None:
         command.extend(("--pcoa-memory-budget-gb", str(args.pcoa_memory_budget_gb)))
     if args.sampling_depth is not None:

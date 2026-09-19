@@ -4,7 +4,7 @@ A prototype project to process ENA 16S forward reads, denoise with Deblur, and g
 
 ## Environment setup
 
-This pipeline runs inside a single [QIIME2 Rachis environment](https://library.qiime2.org/quickstart/qiime2). QIIME2 supplies Deblur, BIOM, scikit-bio, seqkit, matplotlib, pandas, requests, vsearch, and UniFrac support. This repo adds `fastq-dl` for ENA downloads and `q2-greengenes2` for Greengenes2-backed UniFrac.
+The Python pipeline runs inside a [QIIME2 Rachis environment](https://library.qiime2.org/quickstart/qiime2). QIIME2 supplies Deblur, BIOM, scikit-bio, seqkit, matplotlib, pandas, requests, vsearch, and Greengenes2 mapping. DartUniFrac is installed in a small separate environment and invoked as an external executable; this avoids disturbing QIIME2's tightly pinned dependency stack.
 
 The environment is assembled in three layers:
 
@@ -42,6 +42,16 @@ deblur --help
 qiime info
 python -c "import skbio; print(skbio.__version__)"
 ```
+
+Install the pinned CPU DartUniFrac release in a separate environment:
+
+```bash
+conda create -n dartunifrac-0.3.0 -c conda-forge -c bioconda dartunifrac=0.3.0
+conda run -n dartunifrac-0.3.0 dartunifrac --version
+```
+
+Pass its absolute executable path when it is not already on `PATH`, for example
+`--dartunifrac-executable ~/.conda/envs/dartunifrac-0.3.0/bin/dartunifrac`.
 
 ### Existing QIIME2 env
 
@@ -261,7 +271,7 @@ text file or a CSV/TSV with `sample_id`, `sample-id`, `run_accession`, or
 visible as `excluded_assay` in the processing report but are never sent to
 Deblur.
 
-`unifrac.py` uses GG2's `non-v4-16s` closed-reference action (vsearch at 99%) to map Deblur ASVs onto the GG2 backbone, then computes UniFrac against the GG2 ID phylogeny. Rarefaction depth defaults to 1,000 reads after backbone mapping; override with `--sampling-depth`.
+`unifrac.py` uses GG2's `non-v4-16s` closed-reference action (vsearch at 99%) to map Deblur ASVs onto the GG2 backbone. QIIME2 also performs feature-table rarefaction, which defaults to 1,000 reads after mapping. DartUniFrac is then the default engine for unweighted UniFrac and its 10-axis randomized fPCoA (`dmh`, sketch 2048, seed 1337, 16-bit hashes). Use `--unifrac-engine qiime` for the exact QIIME2 fallback.
 
 ### Faith's PD alpha rarefaction
 
@@ -305,14 +315,18 @@ python src/alpha_rarefaction.py group-plot \
   --output results/full/alpha_rarefaction/faith_pd_by_sampling_site.png
 ```
 
-PCoA defaults to `--pcoa-method auto`. It estimates exact eigendecomposition
-memory as `72 × samples²` bytes after rarefaction. Exact PCoA is used when the
-estimate fits within 80% of `--pcoa-memory-budget-gb`, the SLURM memory
-allocation, or detected available RAM; otherwise QIIME2 FSVD computes the first
-10 axes (configurable with `--pcoa-dimensions`). The UniFrac distance QZA is
-always retained. `--export-distance-tsv auto` skips only the redundant text
-copy when its projected size exceeds 20 GiB; use `always` or `never` to force a
-policy.
+With the default DART engine, the distance matrix stays compressed with zstd in
+the run work directory when `--export-distance-tsv auto` projects that the text
+matrix would exceed 20 GiB. Use `always` or `never` to force a policy. DART
+fPCoA emits 10 axes. With `--unifrac-engine qiime`, `--pcoa-method auto`
+retains the earlier behavior: it estimates exact eigendecomposition memory as
+`72 × samples²` bytes and switches to QIIME2 FSVD when the exact estimate does
+not fit the configured or detected memory budget.
+
+For backend acceptance testing, `src/compare_unifrac_backends.py` compares exact
+QIIME2 and DART distance matrices plus both ordinations. It validates sample
+IDs, symmetry, diagonals, Pearson/Spearman correlation, RMSE, and 10-axis
+Procrustes fits, and exits nonzero when the configured project gates are not met.
 
 ### Resume a Failed Run
 
@@ -362,7 +376,9 @@ examples, environment overrides, and monitoring commands.
 | `src/run_deblur.py` | QIIME2 + repo extras | Run Deblur on a directory of forward FASTQs |
 | `src/deblur_scheduler.py` | QIIME2 + repo extras | Balance Deblur shards and isolate sample-level failures |
 | `src/merge_biom.py` | QIIME2 + repo extras | Merge BIOM tables across studies |
-| `src/unifrac.py` | QIIME2 + repo extras | UniFrac PCoA via GG2 and QIIME2 |
+| `src/unifrac.py` | QIIME2 + external DART | GG2 mapping/rarefaction plus DART (default) or QIIME UniFrac PCoA |
+| `src/dart_unifrac.py` | QIIME2 + external DART | Extract validated DART inputs and execute the DART backend |
+| `src/compare_unifrac_backends.py` | QIIME2 + scipy | Quantitative DART-versus-QIIME acceptance comparison |
 | `src/alpha_rarefaction.py` | QIIME2 + repo extras | Faith's PD alpha-rarefaction from an existing GG2-mapped table |
 | `src/plot_pcoa.py` | QIIME2 + repo extras | Plot PCoA coordinates colored by metadata |
 | `src/validate_pipeline_run.py` | Python | Validate terminal state and required outputs |
@@ -401,8 +417,7 @@ For `unifrac.py`, the detailed operations distinguish:
 - Greengenes2 `non-v4-16s` backbone mapping
 - mapped-table export and rarefaction-depth handling
 - feature-table rarefaction
-- `diversity beta-phylogenetic`, the actual unweighted UniFrac calculation
-- `diversity pcoa`
+- DART `dmh` UniFrac plus fPCoA, or QIIME2 `diversity beta-phylogenetic` and `pcoa`
 - artifact exports and local plotting
 
 For a complete benchmark, use a fresh run directory. A validated resume can
