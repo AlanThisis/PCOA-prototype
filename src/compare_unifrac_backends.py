@@ -5,18 +5,16 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import random
 import subprocess
+import tempfile
 from contextlib import contextmanager
-from itertools import chain
 from pathlib import Path
 from typing import Iterator, TextIO
 
 import matplotlib.pyplot as plt
 import numpy as np
-import skbio
 from scipy.spatial import procrustes
-from scipy.stats import pearsonr, spearmanr
+from scipy.stats import spearmanr
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,16 +22,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qiime-distance", type=Path, required=True)
     parser.add_argument("--dart-distance", type=Path, required=True)
     parser.add_argument("--qiime-ordination", type=Path, required=True)
+    parser.add_argument(
+        "--dart-exact-ordination",
+        type=Path,
+        required=True,
+        help="Exact eigh PCoA computed from the DART distance matrix.",
+    )
     parser.add_argument("--dart-ordination", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--dimensions", type=int, default=10)
     parser.add_argument("--permutations", type=int, default=999)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
-        "--max-distance-samples",
+        "--spearman-pairs",
         type=int,
-        default=2500,
-        help="Deterministic sample limit for distance comparisons (default: 2500).",
+        default=10_000_000,
+        help=(
+            "Maximum uniformly sampled distance pairs for Spearman correlation. "
+            "Pearson and RMSE always use every pair; use 0 for every pair."
+        ),
     )
     return parser.parse_args()
 
@@ -60,104 +67,285 @@ def open_distance_text(path: Path) -> Iterator[TextIO]:
             raise RuntimeError(f"zstd failed with exit code {exit_code}: {path}")
 
 
-def normalized_distance_header(header: list[str], first_row: list[str]) -> list[str]:
-    if len(header) == len(first_row):
-        return header[1:]
-    if len(header) == len(first_row) - 1:
-        return header
-    raise ValueError(
-        "Distance matrix header/row widths are inconsistent: "
-        f"header={len(header)}, row={len(first_row)}"
-    )
+def distance_header(handle: TextIO, path: Path) -> list[str]:
+    header = handle.readline().rstrip("\n\r").split("\t")
+    if header and header[0] == "":
+        header = header[1:]
+    if len(header) < 2:
+        raise ValueError(f"Distance matrix has an invalid header: {path}")
+    return header
 
 
-def distance_ids(path: Path) -> list[str]:
-    with open_distance_text(path) as handle:
-        reader = csv.reader(handle, delimiter="\t")
-        header = next(reader)
-        first_row = next(reader)
-    return normalized_distance_header(header, first_row)
+def sample_pairs(
+    sample_count: int, pair_count: int, seed: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Uniformly sample off-diagonal unordered pairs, with replacement."""
+    rng = np.random.default_rng(seed)
+    first_parts: list[np.ndarray] = []
+    second_parts: list[np.ndarray] = []
+    remaining = pair_count
+    while remaining:
+        draw = max(remaining + remaining // 20, 1024)
+        first = rng.integers(0, sample_count, size=draw, dtype=np.int64)
+        second = rng.integers(0, sample_count, size=draw, dtype=np.int64)
+        keep = first != second
+        first = first[keep][:remaining]
+        second = second[keep][:remaining]
+        first_parts.append(np.minimum(first, second))
+        second_parts.append(np.maximum(first, second))
+        remaining -= len(first)
+    return np.concatenate(first_parts), np.concatenate(second_parts)
 
 
-def read_distance_subset(path: Path, selected_ids: list[str]) -> np.ndarray:
-    wanted = set(selected_ids)
-    with open_distance_text(path) as handle:
-        reader = csv.reader(handle, delimiter="\t")
-        header = next(reader)
-        first_row = next(reader)
-        column_ids = normalized_distance_header(header, first_row)
-        column_index = {sample_id: index for index, sample_id in enumerate(column_ids)}
-        missing = wanted - column_index.keys()
-        if missing:
-            raise ValueError(f"Distance matrix lacks selected IDs: {sorted(missing)[:5]}")
-        selected_columns = [column_index[sample_id] for sample_id in selected_ids]
-        rows: dict[str, np.ndarray] = {}
-        for fields in chain((first_row,), reader):
-            if not fields:
-                continue
-            sample_id = fields[0]
-            if sample_id in wanted:
-                values = fields[1:]
-                rows[sample_id] = np.asarray(
-                    [float(values[index]) for index in selected_columns], dtype=float
+def compare_distance_matrices(
+    qiime_path: Path,
+    dart_path: Path,
+    *,
+    spearman_pairs: int,
+    seed: int,
+    scratch_dir: Path,
+) -> tuple[
+    list[str], dict[str, float | int | str], np.ndarray, np.ndarray, np.ndarray
+]:
+    """Compare all distance pairs while bounding only Spearman rank storage."""
+    with open_distance_text(qiime_path) as qiime_handle, open_distance_text(
+        dart_path
+    ) as dart_handle:
+        ids = distance_header(qiime_handle, qiime_path)
+        dart_ids = distance_header(dart_handle, dart_path)
+        if ids != dart_ids:
+            if set(ids) == set(dart_ids):
+                raise ValueError(
+                    "Distance matrix IDs match but their order differs; reorder the "
+                    "matrices before full streaming comparison"
                 )
-    missing_rows = wanted - rows.keys()
-    if missing_rows:
-        raise ValueError(f"Distance matrix lacks selected rows: {sorted(missing_rows)[:5]}")
-    return np.vstack([rows[sample_id] for sample_id in selected_ids])
+            raise ValueError(
+                "Distance matrix sample IDs differ: "
+                f"QIIME-only={len(set(ids) - set(dart_ids))}, "
+                f"DART-only={len(set(dart_ids) - set(ids))}"
+            )
 
+        sample_count = len(ids)
+        total_pairs = sample_count * (sample_count - 1) // 2
+        exact_spearman = spearman_pairs == 0 or spearman_pairs >= total_pairs
+        retained_pairs = total_pairs if exact_spearman else spearman_pairs
+        if exact_spearman:
+            sampled_rows = sampled_columns = None
+            sampled_qiime_parts: list[np.ndarray] = []
+            sampled_dart_parts: list[np.ndarray] = []
+        else:
+            sampled_rows, sampled_columns = sample_pairs(
+                sample_count, retained_pairs, seed
+            )
+            order = np.argsort(sampled_rows, kind="stable")
+            sampled_rows = sampled_rows[order]
+            sampled_columns = sampled_columns[order]
+            sampled_qiime = np.empty(retained_pairs, dtype=np.float64)
+            sampled_dart = np.empty(retained_pairs, dtype=np.float64)
 
-def deterministic_common_ids(
-    first: Path, second: Path, maximum: int, seed: int
-) -> tuple[list[str], dict[str, int]]:
-    first_ids = distance_ids(first)
-    second_ids = distance_ids(second)
-    if set(first_ids) != set(second_ids):
-        raise ValueError(
-            "Distance matrix sample IDs differ: "
-            f"QIIME-only={len(set(first_ids) - set(second_ids))}, "
-            f"DART-only={len(set(second_ids) - set(first_ids))}"
-        )
-    selected = sorted(first_ids)
-    if len(selected) > maximum:
-        selected = sorted(random.Random(seed).sample(selected, maximum))
-    return selected, {"total": len(first_ids), "compared": len(selected)}
+        count = 0
+        sum_qiime = sum_dart = 0.0
+        sum_qiime_sq = sum_dart_sq = sum_product = 0.0
+        sum_squared_error = sum_absolute_error = 0.0
+        maximum_absolute_error = 0.0
+        sample_start = 0
+        max_abs_diagonal = {"qiime": 0.0, "dart": 0.0}
+        max_symmetry_error = {"qiime": 0.0, "dart": 0.0}
 
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=".distance-symmetry-", dir=scratch_dir
+        ) as temporary:
+            temporary_path = Path(temporary)
+            qiime_upper_store = np.memmap(
+                temporary_path / "qiime-upper.bin",
+                dtype=np.float64,
+                mode="w+",
+                shape=(total_pairs,),
+            )
+            dart_upper_store = np.memmap(
+                temporary_path / "dart-upper.bin",
+                dtype=np.float64,
+                mode="w+",
+                shape=(total_pairs,),
+            )
 
-def validate_distance(matrix: np.ndarray, label: str) -> dict[str, float]:
-    symmetry = float(np.max(np.abs(matrix - matrix.T)))
-    diagonal = float(np.max(np.abs(np.diag(matrix))))
-    if symmetry > 1e-8 or diagonal > 1e-8:
-        raise ValueError(
-            f"{label} distance matrix is invalid: "
-            f"max symmetry error={symmetry}, max diagonal={diagonal}"
-        )
-    return {"max_symmetry_error": symmetry, "max_abs_diagonal": diagonal}
+            for row_index, (qiime_line, dart_line) in enumerate(
+                zip(qiime_handle, dart_handle, strict=True)
+            ):
+                qiime_id, separator, qiime_text = qiime_line.partition("\t")
+                dart_id, dart_separator, dart_text = dart_line.partition("\t")
+                if not separator or not dart_separator or qiime_id != ids[row_index]:
+                    raise ValueError(f"Invalid QIIME row {row_index} in {qiime_path}")
+                if dart_id != qiime_id:
+                    raise ValueError(
+                        f"Distance matrix row IDs differ at row {row_index}: "
+                        f"{qiime_id!r} != {dart_id!r}"
+                    )
+                qiime_row = np.fromstring(qiime_text, sep="\t", dtype=np.float64)
+                dart_row = np.fromstring(dart_text, sep="\t", dtype=np.float64)
+                if len(qiime_row) != sample_count or len(dart_row) != sample_count:
+                    raise ValueError(f"Invalid distance row width for {qiime_id}")
+                max_abs_diagonal["qiime"] = max(
+                    max_abs_diagonal["qiime"], abs(float(qiime_row[row_index]))
+                )
+                max_abs_diagonal["dart"] = max(
+                    max_abs_diagonal["dart"], abs(float(dart_row[row_index]))
+                )
 
+                if row_index:
+                    columns = np.arange(row_index, dtype=np.int64)
+                    prior_indices = (
+                        columns * sample_count
+                        - columns * (columns + 1) // 2
+                        + row_index
+                        - columns
+                        - 1
+                    )
+                    max_symmetry_error["qiime"] = max(
+                        max_symmetry_error["qiime"],
+                        float(
+                            np.max(
+                                np.abs(
+                                    qiime_row[:row_index]
+                                    - qiime_upper_store[prior_indices]
+                                )
+                            )
+                        ),
+                    )
+                    max_symmetry_error["dart"] = max(
+                        max_symmetry_error["dart"],
+                        float(
+                            np.max(
+                                np.abs(
+                                    dart_row[:row_index]
+                                    - dart_upper_store[prior_indices]
+                                )
+                            )
+                        ),
+                    )
 
-def ordination_coordinates(path: Path, ids: list[str], dimensions: int) -> np.ndarray:
-    result = skbio.io.read(
-        str(path),
-        format="ordination",
-        into=skbio.stats.ordination.OrdinationResults,
+                qiime_upper = qiime_row[row_index + 1 :]
+                dart_upper = dart_row[row_index + 1 :]
+                pair_count = len(qiime_upper)
+                upper_start = (
+                    row_index * sample_count - row_index * (row_index + 1) // 2
+                )
+                upper_end = upper_start + pair_count
+                qiime_upper_store[upper_start:upper_end] = qiime_upper
+                dart_upper_store[upper_start:upper_end] = dart_upper
+
+                residuals = dart_upper - qiime_upper
+                count += pair_count
+                sum_qiime += float(qiime_upper.sum(dtype=np.float64))
+                sum_dart += float(dart_upper.sum(dtype=np.float64))
+                sum_qiime_sq += float(np.dot(qiime_upper, qiime_upper))
+                sum_dart_sq += float(np.dot(dart_upper, dart_upper))
+                sum_product += float(np.dot(qiime_upper, dart_upper))
+                sum_squared_error += float(np.dot(residuals, residuals))
+                sum_absolute_error += float(np.abs(residuals).sum(dtype=np.float64))
+                if pair_count:
+                    maximum_absolute_error = max(
+                        maximum_absolute_error, float(np.abs(residuals).max())
+                    )
+
+                if exact_spearman:
+                    sampled_qiime_parts.append(qiime_upper.copy())
+                    sampled_dart_parts.append(dart_upper.copy())
+                else:
+                    assert sampled_rows is not None and sampled_columns is not None
+                    sample_end = int(
+                        np.searchsorted(sampled_rows, row_index, side="right")
+                    )
+                    columns = sampled_columns[sample_start:sample_end]
+                    sampled_qiime[sample_start:sample_end] = qiime_row[columns]
+                    sampled_dart[sample_start:sample_end] = dart_row[columns]
+                    sample_start = sample_end
+
+            qiime_upper_store.flush()
+            dart_upper_store.flush()
+            del qiime_upper_store, dart_upper_store
+
+        if count != total_pairs:
+            raise ValueError(f"Expected {total_pairs} distance pairs, observed {count}")
+        if max(max_abs_diagonal.values()) > 1e-8:
+            raise ValueError(
+                "Distance matrix diagonal is nonzero: "
+                f"QIIME={max_abs_diagonal['qiime']}, "
+                f"DART={max_abs_diagonal['dart']}"
+            )
+        if max(max_symmetry_error.values()) > 1e-8:
+            raise ValueError(
+                "Distance matrix is asymmetric: "
+                f"QIIME={max_symmetry_error['qiime']}, "
+                f"DART={max_symmetry_error['dart']}"
+            )
+        if exact_spearman:
+            sampled_qiime = np.concatenate(sampled_qiime_parts)
+            sampled_dart = np.concatenate(sampled_dart_parts)
+
+    numerator = count * sum_product - sum_qiime * sum_dart
+    denominator = np.sqrt(
+        (count * sum_qiime_sq - sum_qiime**2)
+        * (count * sum_dart_sq - sum_dart**2)
     )
-    missing = set(ids) - set(result.samples.index)
-    if missing:
-        raise ValueError(f"Ordination lacks sample IDs: {sorted(missing)[:5]}")
-    usable = min(dimensions, result.samples.shape[1])
-    if usable < 2:
-        raise ValueError(f"Ordination has fewer than two axes: {path}")
-    return result.samples.loc[ids].iloc[:, :usable].to_numpy(dtype=float)
+    pearson = numerator / denominator
+    spearman = spearmanr(sampled_qiime, sampled_dart).statistic
+    residual_sample = sampled_dart - sampled_qiime
+    metrics: dict[str, float | int | str] = {
+        "sample_count": sample_count,
+        "distance_pair_count": count,
+        "pearson": float(pearson),
+        "pearson_scope": "all_pairs",
+        "spearman": float(spearman),
+        "spearman_scope": "all_pairs" if exact_spearman else "uniform_pair_sample",
+        "spearman_pair_count": len(sampled_qiime),
+        "spearman_seed": seed,
+        "rmse": float(np.sqrt(sum_squared_error / count)),
+        "rmse_scope": "all_pairs",
+        "mae": float(sum_absolute_error / count),
+        "maximum_absolute_error": maximum_absolute_error,
+        "qiime_max_abs_diagonal": max_abs_diagonal["qiime"],
+        "dart_max_abs_diagonal": max_abs_diagonal["dart"],
+        "qiime_max_symmetry_error": max_symmetry_error["qiime"],
+        "dart_max_symmetry_error": max_symmetry_error["dart"],
+    }
+    return ids, metrics, sampled_qiime, sampled_dart, residual_sample
 
 
-def exact_pcoa(matrix: np.ndarray, ids: list[str], dimensions: int) -> np.ndarray:
-    distance = skbio.DistanceMatrix(matrix, ids=ids)
-    result = skbio.stats.ordination.pcoa(
-        distance,
-        method="eigh",
-        number_of_dimensions=min(dimensions, len(ids) - 1),
-    )
-    return result.samples.to_numpy(dtype=float)
+def ordination_coordinates(path: Path, dimensions: int) -> tuple[list[str], np.ndarray]:
+    ids: list[str] = []
+    rows: list[list[float]] = []
+    in_sites = False
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if not in_sites:
+                if line.startswith("Site\t"):
+                    in_sites = True
+                continue
+            if not line.strip():
+                break
+            fields = line.rstrip("\n").split("\t", dimensions + 1)
+            if len(fields) < dimensions + 1:
+                raise ValueError(f"Ordination has fewer than {dimensions} axes: {path}")
+            ids.append(fields[0])
+            rows.append([float(value) for value in fields[1 : dimensions + 1]])
+    if not ids:
+        raise ValueError(f"Ordination contains no sample coordinates: {path}")
+    return ids, np.asarray(rows, dtype=np.float64)
+
+
+def ordination_for_ids(path: Path, ids: list[str], dimensions: int) -> np.ndarray:
+    candidate_ids, candidate = ordination_coordinates(path, dimensions)
+    candidate_index = {sample_id: index for index, sample_id in enumerate(candidate_ids)}
+    missing = set(ids) - candidate_index.keys()
+    extra = set(candidate_ids) - set(ids)
+    if missing or extra:
+        raise ValueError(
+            f"Ordination sample IDs differ from distance matrices for {path}: "
+            f"distance-only={len(missing)}, ordination-only={len(extra)}"
+        )
+    return candidate[[candidate_index[sample_id] for sample_id in ids]]
 
 
 def procrustes_test(
@@ -190,37 +378,27 @@ def procrustes_test(
 
 
 def run(args: argparse.Namespace) -> int:
-    if args.dimensions < 2 or args.permutations < 0 or args.max_distance_samples < 2:
-        raise ValueError("dimensions and sample limit must be >=2; permutations >=0")
-    ids, counts = deterministic_common_ids(
-        args.qiime_distance,
-        args.dart_distance,
-        args.max_distance_samples,
-        args.seed,
+    if args.dimensions < 2 or args.permutations < 0 or args.spearman_pairs < 0:
+        raise ValueError("dimensions must be >=2; permutations and pairs >=0")
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    distance_ids, distance_metrics, qiime_values, dart_values, residuals = (
+        compare_distance_matrices(
+            args.qiime_distance,
+            args.dart_distance,
+            spearman_pairs=args.spearman_pairs,
+            seed=args.seed,
+            scratch_dir=args.out_dir,
+        )
     )
-    qiime_dm = read_distance_subset(args.qiime_distance, ids)
-    dart_dm = read_distance_subset(args.dart_distance, ids)
-    validation = {
-        "qiime": validate_distance(qiime_dm, "QIIME"),
-        "dart": validate_distance(dart_dm, "DART"),
-    }
-    triangle = np.triu_indices(len(ids), k=1)
-    qiime_values = qiime_dm[triangle]
-    dart_values = dart_dm[triangle]
-    residuals = dart_values - qiime_values
-    distance_metrics = {
-        "pearson": float(pearsonr(qiime_values, dart_values).statistic),
-        "spearman": float(spearmanr(qiime_values, dart_values).statistic),
-        "rmse": float(np.sqrt(np.mean(residuals**2))),
-        "mae": float(np.mean(np.abs(residuals))),
-        "maximum_absolute_error": float(np.max(np.abs(residuals))),
-    }
-
-    exact_qiime = exact_pcoa(qiime_dm, ids, args.dimensions)
-    exact_dart = exact_pcoa(dart_dm, ids, args.dimensions)
-    qiime_coords = ordination_coordinates(args.qiime_ordination, ids, args.dimensions)
-    dart_coords = ordination_coordinates(args.dart_ordination, ids, args.dimensions)
-    full_matrix_compared = counts["total"] == counts["compared"]
+    exact_qiime = ordination_for_ids(
+        args.qiime_ordination, distance_ids, args.dimensions
+    )
+    exact_dart = ordination_for_ids(
+        args.dart_exact_ordination, distance_ids, args.dimensions
+    )
+    dart_fpcoa = ordination_for_ids(
+        args.dart_ordination, distance_ids, args.dimensions
+    )
     procrustes_metrics = {
         "distance_only": procrustes_test(
             exact_qiime,
@@ -228,19 +406,15 @@ def run(args: argparse.Namespace) -> int:
             permutations=args.permutations,
             seed=args.seed,
         ),
-        "dart_fpcoa_only": (
-            procrustes_test(
-                exact_dart,
-                dart_coords,
-                permutations=args.permutations,
-                seed=args.seed + 1,
-            )
-            if full_matrix_compared
-            else None
+        "dart_fpcoa_only": procrustes_test(
+            exact_dart,
+            dart_fpcoa,
+            permutations=args.permutations,
+            seed=args.seed + 1,
         ),
         "end_to_end": procrustes_test(
-            qiime_coords,
-            dart_coords,
+            exact_qiime,
+            dart_fpcoa,
             permutations=args.permutations,
             seed=args.seed + 2,
         ),
@@ -263,20 +437,19 @@ def run(args: argparse.Namespace) -> int:
         "fpcoa_procrustes": (
             procrustes_metrics["dart_fpcoa_only"]["m2"]
             <= thresholds["fpcoa_procrustes_m2_maximum"]
-            if procrustes_metrics["dart_fpcoa_only"] is not None
-            else None
         ),
     }
     summary = {
-        "sample_counts": counts,
-        "validation": validation,
+        "sample_counts": {
+            "total": distance_metrics["sample_count"],
+            "ordination": len(distance_ids),
+        },
         "distance_metrics": distance_metrics,
         "procrustes": procrustes_metrics,
         "thresholds": thresholds,
         "gates": gates,
         "passed": all(value for value in gates.values() if value is not None),
     }
-    args.out_dir.mkdir(parents=True, exist_ok=True)
     with (args.out_dir / "comparison_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True)
         handle.write("\n")
@@ -285,7 +458,15 @@ def run(args: argparse.Namespace) -> int:
     ) as handle:
         writer = csv.writer(handle, delimiter="\t")
         writer.writerow(("qiime_distance", "dart_distance", "residual"))
-        writer.writerows(zip(qiime_values, dart_values, residuals, strict=True))
+        output_count = min(len(qiime_values), 100_000)
+        writer.writerows(
+            zip(
+                qiime_values[:output_count],
+                dart_values[:output_count],
+                residuals[:output_count],
+                strict=True,
+            )
+        )
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
     axes[0].hexbin(qiime_values, dart_values, gridsize=60, mincnt=1)

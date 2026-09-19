@@ -324,10 +324,15 @@ retains the earlier behavior: it estimates exact eigendecomposition memory as
 not fit the configured or detected memory budget.
 
 For backend acceptance testing, `src/compare_unifrac_backends.py` compares exact
-QIIME2 and DART distance matrices plus both ordinations. It validates sample
-IDs, symmetry, diagonals, Pearson/Spearman correlation, RMSE, and 10-axis
-Procrustes fits against exact eigendecomposition, and exits nonzero when the
-configured project gates are not met.
+QIIME2 and DART results following the DartUniFrac paper's validation layers.
+Pearson correlation and RMSE stream over every distance pair; Spearman uses all
+pairs when feasible or a disclosed uniform pair sample at repository scale.
+Three 10-axis Procrustes fits are reported separately: exact-QIIME versus
+exact-DART PCoA (distance approximation), exact-DART PCoA versus DART fPCoA
+(ordination approximation), and the end-to-end comparison. Large analyses must
+provide an exact `eigh` ordination computed from the DART distance matrix with
+`--dart-exact-ordination`. The command exits nonzero when configured acceptance
+gates are not met.
 
 ### Resume a Failed Run
 
