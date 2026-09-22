@@ -9,7 +9,9 @@ from plot_pcoa import (
     load_coordinates,
     load_id_to_label,
     resolve_style,
+    run,
 )
+from pipeline_lib import TimingRecorder
 
 
 def style_args(**overrides):
@@ -64,3 +66,46 @@ def test_blank_metadata_labels_become_unknown(tmp_path: Path):
     labels = load_id_to_label(metadata, "environment_harmonized")
 
     assert labels == {"S1": "Gut", "S2": UNKNOWN_LABEL}
+
+
+def test_metadata_forward_read_suffixes_are_normalized(tmp_path: Path):
+    metadata = tmp_path / "metadata.tsv"
+    metadata.write_text(
+        "sample-id\tenvironment_harmonized\nDRR100552_1\tGut\nSRR20_R1_001\tOral\n",
+        encoding="utf-8",
+    )
+
+    labels = load_id_to_label(metadata, "environment_harmonized")
+
+    assert labels == {"DRR100552": "Gut", "SRR20": "Oral"}
+
+
+def test_conflicting_normalized_metadata_ids_are_rejected(tmp_path: Path):
+    metadata = tmp_path / "metadata.tsv"
+    metadata.write_text(
+        "sample-id\tenvironment_harmonized\nS1\tGut\nS1_1\tOral\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Conflicting metadata labels"):
+        load_id_to_label(metadata, "environment_harmonized")
+
+
+def test_plot_rejects_zero_metadata_id_matches(tmp_path: Path):
+    coordinates = tmp_path / "coordinates.tsv"
+    coordinates.write_text(
+        "sample-id\tPC1\tPC2\nS1\t0\t1\nS2\t1\t0\n", encoding="utf-8"
+    )
+    metadata = tmp_path / "metadata.tsv"
+    metadata.write_text(
+        "sample-id\tenvironment_harmonized\nOTHER_1\tGut\n", encoding="utf-8"
+    )
+    args = argparse.Namespace(
+        pc=[1, 2], pcoa=coordinates, variance=None, metadata=metadata,
+        color_by="environment_harmonized", palette_file=None,
+        out=tmp_path / "plot.png", color_key=None, report=None,
+        title=None, legend_title=None, dpi=72, **style_args().__dict__,
+    )
+
+    with pytest.raises(ValueError, match="all-Unknown"):
+        run(args, TimingRecorder(tmp_path / "timings.tsv", component="test"))

@@ -93,8 +93,14 @@ def load_id_to_label(metadata_path: Path, color_by: str) -> dict[str, str]:
             label = row.get(color_by, "").strip() or UNKNOWN_LABEL
             values = row[id_field].split(";") if id_field == "run_accessions" else [row[id_field]]
             for value in values:
-                sample_id = value.strip()
+                sample_id = strip_read_suffix(value.strip())
                 if sample_id:
+                    existing = result.get(sample_id)
+                    if existing is not None and existing != label:
+                        raise ValueError(
+                            "Conflicting metadata labels after normalizing read "
+                            f"suffixes for {sample_id!r}: {existing!r} vs {label!r}"
+                        )
                     result[sample_id] = label
     return result
 
@@ -233,6 +239,14 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
         palette = load_palette(args.palette_file)
 
     coords["sample-id"] = coords["sample-id"].astype(str).map(strip_read_suffix)
+    metadata_matched = coords["sample-id"].isin(id_to_label)
+    matched_samples = int(metadata_matched.sum())
+    unmatched_samples = int((~metadata_matched).sum())
+    if matched_samples == 0:
+        raise ValueError(
+            "No PCoA sample IDs matched the metadata after normalizing forward-read "
+            "suffixes; refusing to generate an all-Unknown plot"
+        )
     coords["label"] = coords["sample-id"].map(id_to_label).fillna(UNKNOWN_LABEL)
     counts = coords["label"].value_counts().to_dict()
     labels = sorted(counts, key=lambda label: (-counts[label], label.casefold()))
@@ -286,7 +300,8 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
         "pcoa": str(args.pcoa), "metadata": str(args.metadata),
         "color_by": args.color_by, "samples_plotted": len(coords),
         "metadata_categories": len(labels),
-        "unmatched_samples": counts.get(UNKNOWN_LABEL, 0),
+        "matched_samples": matched_samples,
+        "unmatched_samples": unmatched_samples,
         "pc": args.pc, "proportion_explained": list(proportions),
         "style": asdict(style), "output": str(args.out),
         "color_key": str(color_key),
@@ -295,7 +310,7 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(f"Saved {args.out}", file=sys.stderr)
     print(f"Samples={len(coords):,}; categories={len(labels)}; "
-          f"unmatched={counts.get(UNKNOWN_LABEL, 0):,}; "
+          f"unmatched={unmatched_samples:,}; "
           f"point_size={style.point_size:.1f}; alpha={style.alpha:.2f}; "
           f"legend={style.legend}", file=sys.stderr)
     return 0
