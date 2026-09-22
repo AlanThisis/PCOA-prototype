@@ -67,7 +67,7 @@ def make_figure(
         axis.set_xlabel("Aligned axis 1")
         axis.set_ylabel("Aligned axis 2")
     # Individual panel titles identify which color corresponds to which level.
-    figure.suptitle(f"{title}\nGray = first level; orange = second level", fontsize=15)
+    figure.suptitle(f"{title} | gray = first; orange = second", fontsize=14)
     figure.savefig(output, dpi=180)
     plt.close(figure)
 
