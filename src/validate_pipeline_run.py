@@ -89,9 +89,16 @@ def validate_run(run_dir: Path) -> list[str]:
     if analysis.get("rarefied_samples", 0) <= 0:
         problems.append("analysis reports no samples retained after rarefaction")
     distance = analysis.get("distance_tsv", {})
-    qza_path = Path(distance.get("qza_path", ""))
-    if not qza_path.is_file() or qza_path.stat().st_size == 0:
-        problems.append("UniFrac distance QZA is missing or empty")
+    # Older QIIME summaries used qza_path; current QIIME and DART summaries
+    # record the native distance artifact under backend_path.
+    backend_path = distance.get("backend_path") or distance.get("qza_path")
+    distance_artifact = Path(backend_path) if backend_path else None
+    if (
+        distance_artifact is None
+        or not distance_artifact.is_file()
+        or distance_artifact.stat().st_size == 0
+    ):
+        problems.append("UniFrac distance artifact is missing or empty")
     if distance.get("exported"):
         distance_tsv = results / "distance_matrix_unweighted_unifrac.tsv"
         if not distance_tsv.is_file() or distance_tsv.stat().st_size == 0:
