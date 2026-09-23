@@ -118,9 +118,14 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
         raise ValueError("No non-empty Deblur outputs are available to merge")
 
     with timing.step("merge_feature_tables", item=f"{len(tables)} tables"):
-        merged = tables[0]
-        for t in tables[1:]:
-            merged = merged.merge(t)
+        chunk_size = 30
+        merged = None
+        for start in range(0, len(tables), chunk_size):
+            chunk = tables[start : start + chunk_size]
+            if merged is None:
+                merged = chunk[0].concat(chunk[1:]) if len(chunk) > 1 else chunk[0]
+            else:
+                merged = merged.concat(chunk)
         merged, removed_features = remove_empty_observations(merged)
 
     print(f"Merged: {merged.shape[1]} samples, {merged.shape[0]} features")
