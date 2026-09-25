@@ -34,13 +34,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, default=50000,
                         help="Safety limit: error if distance matrix exceeds this many samples.")
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--tmp-dir", type=Path, default=None,
+                        help="Directory for temp decompressed files (default: system /tmp).")
     return parser.parse_args()
 
 
-def load_distance_matrix(path: Path, max_samples: int) -> skbio.DistanceMatrix:
+def load_distance_matrix(path: Path, max_samples: int,
+                         tmp_dir: Path | None = None) -> skbio.DistanceMatrix:
     if path.suffix == ".zst" or str(path).endswith(".tsv.zst"):
         print(f"Decompressing {path} via zstd...", flush=True)
-        with tempfile.NamedTemporaryFile(suffix=".tsv", delete=True) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".tsv", delete=True,
+                                         dir=tmp_dir) as tmp:
             subprocess.run(
                 ["zstd", "-dcf", "-o", tmp.name, str(path)],
                 check=True,
@@ -76,7 +80,10 @@ def main() -> int:
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    dm = load_distance_matrix(args.distance_matrix, args.max_samples)
+    if args.tmp_dir:
+        args.tmp_dir.mkdir(parents=True, exist_ok=True)
+    dm = load_distance_matrix(args.distance_matrix, args.max_samples,
+                              tmp_dir=args.tmp_dir)
     grouping = load_metadata(args.metadata, args.grouping_column)
 
     shared = sorted(set(dm.ids) & set(grouping.index))
