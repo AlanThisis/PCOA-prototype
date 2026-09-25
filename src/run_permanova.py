@@ -14,6 +14,7 @@ import argparse
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -39,15 +40,13 @@ def parse_args() -> argparse.Namespace:
 def load_distance_matrix(path: Path, max_samples: int) -> skbio.DistanceMatrix:
     if path.suffix == ".zst" or str(path).endswith(".tsv.zst"):
         print(f"Decompressing {path} via zstd...", flush=True)
-        proc = subprocess.Popen(
-            ["zstd", "-dc", str(path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        dm = skbio.DistanceMatrix.read(proc.stdout)
-        proc.wait()
-        if proc.returncode != 0:
-            raise RuntimeError(f"zstd decompression failed: {proc.stderr.read().decode()}")
+        with tempfile.NamedTemporaryFile(suffix=".tsv", delete=True) as tmp:
+            subprocess.run(
+                ["zstd", "-dc", "-o", tmp.name, str(path)],
+                check=True,
+            )
+            print(f"Reading decompressed distance matrix from {tmp.name}...", flush=True)
+            dm = skbio.DistanceMatrix.read(tmp.name)
     else:
         dm = skbio.DistanceMatrix.read(str(path))
     n = dm.shape[0]
