@@ -42,7 +42,7 @@ def load_distance_matrix(path: Path, max_samples: int) -> skbio.DistanceMatrix:
         print(f"Decompressing {path} via zstd...", flush=True)
         with tempfile.NamedTemporaryFile(suffix=".tsv", delete=True) as tmp:
             subprocess.run(
-                ["zstd", "-dc", "-o", tmp.name, str(path)],
+                ["zstd", "-dcf", "-o", tmp.name, str(path)],
                 check=True,
             )
             print(f"Reading decompressed distance matrix from {tmp.name}...", flush=True)
