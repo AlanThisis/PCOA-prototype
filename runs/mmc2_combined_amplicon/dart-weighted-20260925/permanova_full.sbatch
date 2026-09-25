@@ -3,7 +3,7 @@
 #SBATCH --partition=long
 #SBATCH --time=7-00:00:00
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=512G
+#SBATCH --mem=500G
 #SBATCH --output=/home/yal090/PCOA-prototype/runs/mmc2_combined_amplicon/dart-weighted-20260925/logs/%j-perm-full.out
 #SBATCH --error=/home/yal090/PCOA-prototype/runs/mmc2_combined_amplicon/dart-weighted-20260925/logs/%j-perm-full.err
 
