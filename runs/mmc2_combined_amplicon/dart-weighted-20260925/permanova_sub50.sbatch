@@ -3,7 +3,7 @@
 #SBATCH --partition=short
 #SBATCH --time=1-00:00:00
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=256G
+#SBATCH --mem=350G
 #SBATCH --output=/home/yal090/PCOA-prototype/runs/mmc2_combined_amplicon/dart-weighted-20260925/logs/%j-perm-sub50.out
 #SBATCH --error=/home/yal090/PCOA-prototype/runs/mmc2_combined_amplicon/dart-weighted-20260925/logs/%j-perm-sub50.err
 
@@ -17,5 +17,5 @@ python -u src/run_permanova.py \
   --metadata runs/mmc2_combined_amplicon/dart-20260921/full/metadata/illumina_pipeline_metadata.tsv \
   --grouping-column environment_harmonized \
   --permutations 999 \
-  --max-samples 100000 \
+  --max-samples 150000 \
   --out-dir runs/mmc2_combined_amplicon/dart-weighted-20260925/permanova/unweighted/sub50/
