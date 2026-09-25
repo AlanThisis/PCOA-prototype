@@ -91,6 +91,7 @@ def build_dart_command(
     seed: int,
     bbits: int,
     compress: bool,
+    weighted: bool = False,
 ) -> list[str]:
     command = [
         executable,
@@ -112,6 +113,8 @@ def build_dart_command(
         str(bbits),
         "--pcoa",
     ]
+    if weighted:
+        command.append("--weighted")
     if compress:
         command.append("--compress")
     return command
@@ -162,10 +165,12 @@ def run_dart_unifrac(
     bbits: int,
     compress: bool,
     timing: TimingRecorder,
+    weighted: bool = False,
 ) -> dict[str, object]:
     """Run DART DMH UniFrac plus fPCoA and validate its stable outputs."""
     work_dir.mkdir(parents=True, exist_ok=True)
-    distance_requested = work_dir / "unweighted_unifrac_distance_matrix.tsv"
+    metric = "weighted" if weighted else "unweighted"
+    distance_requested = work_dir / f"{metric}_unifrac_distance_matrix.tsv"
     for candidate in (
         distance_requested,
         Path(str(distance_requested) + ".zst"),
@@ -183,12 +188,13 @@ def run_dart_unifrac(
         seed=seed,
         bbits=bbits,
         compress=compress,
+        weighted=weighted,
     )
     run_command(
         command,
         cwd=work_dir,
         timing=timing,
-        step="dart_unifrac_fpcoa",
+        step=f"dart_{metric}_unifrac_fpcoa",
         item=str(distance_requested),
     )
     distance_fp = _find_distance_output(distance_requested, compress)
