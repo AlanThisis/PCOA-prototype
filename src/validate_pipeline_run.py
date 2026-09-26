@@ -51,11 +51,27 @@ def validate_run(run_dir: Path) -> list[str]:
         path = results / filename
         if not path.is_file() or path.stat().st_size == 0:
             problems.append(f"missing or empty result: {filename}")
+    alpha = manifest.get("alpha", {})
     for column in manifest.get("color_by", []):
         safe_column = re.sub(r"[^A-Za-z0-9._-]+", "_", column).strip("._")
-        plot = results / f"pcoa_{safe_column}.png"
-        if not plot.is_file() or plot.stat().st_size == 0:
-            problems.append(f"missing or empty colored plot: {plot.name}")
+        plots = [results / f"pcoa_{safe_column}.png"]
+        if alpha.get("faith_pd"):
+            plots.append(results / f"faith_pd_{safe_column}.png")
+        for plot in plots:
+            if not plot.is_file() or plot.stat().st_size == 0:
+                problems.append(f"missing or empty colored plot: {plot.name}")
+    alpha_outputs = []
+    if alpha.get("faith_pd"):
+        alpha_outputs += ["faith_pd.tsv", "faith_pd_summary.json"]
+    if alpha.get("alpha_rarefaction"):
+        alpha_outputs += [
+            "alpha_rarefaction/faith_pd_curve_summary.tsv",
+            "alpha_rarefaction/faith_pd_alpha_rarefaction.png",
+        ]
+    for filename in alpha_outputs:
+        path = results / filename
+        if not path.is_file() or path.stat().st_size == 0:
+            problems.append(f"missing or empty alpha diversity result: {filename}")
 
     sample_status = results / "sample_processing_status.tsv"
     deblur_summary_path = results / "deblur_processing_summary.json"

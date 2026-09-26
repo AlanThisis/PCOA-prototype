@@ -208,7 +208,11 @@ runs/prjeb44533/sub10-001/
     ├── pipeline_summary.json
     ├── pcoa_coordinates_unweighted_unifrac.txt
     ├── pcoa_plot_unweighted_unifrac.png
-    └── pcoa_description.png
+    ├── pcoa_description.png
+    ├── faith_pd.tsv                     # default; --no-faith-pd to skip
+    ├── faith_pd_summary.json
+    ├── faith_pd_description.png         # one box plot per --color-by column
+    └── alpha_rarefaction/               # only with --alpha-rarefaction
 ```
 
 Use `--trim-length 120` for PRJEB44533 because the reads are about 122 bp.
@@ -274,6 +278,41 @@ Deblur.
 `unifrac.py` uses GG2's `non-v4-16s` closed-reference action (vsearch at 99%) to map Deblur ASVs onto the GG2 backbone. QIIME2 also performs feature-table rarefaction, which defaults to 1,000 reads after mapping. DartUniFrac is then the default engine for unweighted UniFrac and its 10-axis randomized fPCoA (`dmh`, sketch 2048, seed 1337, 16-bit hashes). Use `--unifrac-engine qiime` for the exact QIIME2 fallback.
 
 Pass `--metric weighted` (to `run_pipeline.py` or `unifrac.py`) for weighted UniFrac instead. This is normalized weighted UniFrac on both engines: DART's `--weighted` and QIIME2's `weighted_normalized_unifrac`. Result files then use `weighted` in place of `unweighted`, for example `pcoa_coordinates_weighted_unifrac.txt`.
+
+### Faith's PD alpha diversity
+
+By default, `run_pipeline.py` computes Faith's PD on the same rarefied
+GG2-mapped table UniFrac used, so alpha and beta diversity share one random
+draw. It writes `results/faith_pd.tsv` (one value per sample) and, for each
+`--color-by` column, a box plot with a Kruskal-Wallis test and epsilon-squared
+effect size. Pass `--no-faith-pd` to skip it, or `--alpha-rarefaction` to also
+run the rarefaction curve below as a pipeline stage. Resuming an older run adds
+the Faith's PD stage without rerunning anything else.
+
+The same step runs standalone on any completed run:
+
+```bash
+python src/faith_pd.py run \
+  --rarefied-table runs/example/work/qiime2/rarefied-backbone-mapped-table.qza \
+  --phylogeny data/gg2/2024.09.phylogeny.id.nwk.qza \
+  --metadata data/metadata.tsv --group-by environment_harmonized \
+  --output-dir runs/example/results
+```
+
+To compare runs, such as read-subsampling levels, on shared samples (the first
+`--run` is the reference):
+
+```bash
+python src/faith_pd.py compare \
+  --run full=runs/full/results/faith_pd.tsv \
+  --run sub10=runs/sub10/results/faith_pd.tsv \
+  --metadata data/metadata.tsv --group-by environment_harmonized \
+  --output-dir results/faith_pd_levels
+```
+
+It writes a grouped box plot per level, per-sample agreement plots against the
+reference, and a summary of Kruskal-Wallis effect size, Spearman agreement, and
+median percent change per run. Pass `--cohort-ids` to fix the sample set.
 
 ### Faith's PD alpha rarefaction
 

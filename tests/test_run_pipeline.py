@@ -87,6 +87,20 @@ def install_fake_environment(
                     (output_dir / filename).write_text('{"rarefied_samples": 1}\n')
                 else:
                     (output_dir / filename).write_bytes(b"result")
+        elif script == "faith_pd.py":
+            output_dir = command_value(command, "--output-dir")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "faith_pd.tsv").write_text("sample-id\tfaith_pd\nERR1\t1.0\n")
+            (output_dir / "faith_pd_summary.json").write_text("{}\n")
+            for index, value in enumerate(command):
+                if value == "--group-by":
+                    column = run_pipeline.safe_output_name(command[index + 1])
+                    (output_dir / f"faith_pd_{column}.png").write_bytes(b"plot")
+        elif script == "alpha_rarefaction.py":
+            output_dir = command_value(command, "--output-dir")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for filename in run_pipeline.ALPHA_RAREFACTION_OUTPUT_NAMES:
+                (output_dir / filename).write_bytes(b"curve")
         elif script == "plot_pcoa.py":
             output_path = command_value(command, "--out")
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,6 +163,7 @@ def test_one_study_run_skips_merge_and_writes_manifest_and_state(
     assert [Path(command[1]).name for command in commands] == [
         "run_deblur.py",
         "unifrac.py",
+        "faith_pd.py",
     ]
     unifrac_command = commands[1]
     assert command_value(unifrac_command, "--deblur-dir") == (
@@ -164,7 +179,7 @@ def test_one_study_run_skips_merge_and_writes_manifest_and_state(
     )
     assert manifest["studies"][0]["fastqs"][0]["size"] > 0
     state = json.loads((run_dir / "run_state.json").read_text())
-    assert set(state["stages"]) == {"deblur:ERP", "unifrac"}
+    assert set(state["stages"]) == {"deblur:ERP", "unifrac", "faith_pd"}
     assert all(stage["status"] == "completed" for stage in state["stages"].values())
     assert state["attempts"][0]["threads"] == 16
     assert (run_dir / "timings" / "attempt-001" / "pipeline.tsv").is_file()
@@ -200,6 +215,7 @@ def test_cross_study_run_merges_and_generates_metadata_plots(
         "unifrac.py",
         "plot_pcoa.py",
         "plot_pcoa.py",
+        "faith_pd.py",
     ]
     assert all("--keep-tmp-files" in command for command in commands[:2])
     merge_command = commands[2]
@@ -389,10 +405,11 @@ def test_balanced_scheduler_is_default_and_bypasses_study_merge(
     assert [Path(command[1]).name for command in commands] == [
         "deblur_scheduler.py",
         "unifrac.py",
+        "faith_pd.py",
     ]
     assert (run_dir / "work" / "deblur-balanced" / "shard_manifest.tsv").is_file()
     state = json.loads((run_dir / "run_state.json").read_text())
-    assert set(state["stages"]) == {"deblur:balanced", "unifrac"}
+    assert set(state["stages"]) == {"deblur:balanced", "unifrac", "faith_pd"}
     assert state["attempts"][0]["deblur_concurrent_shards"] == 8
 
 
@@ -513,7 +530,10 @@ def test_failed_stage_is_persisted_and_can_be_resumed(
     )
     run_pipeline.execute_pipeline(resume_args)
 
-    assert [Path(command[1]).name for command in resumed_commands] == ["unifrac.py"]
+    assert [Path(command[1]).name for command in resumed_commands] == [
+        "unifrac.py",
+        "faith_pd.py",
+    ]
     assert "--refresh-input-artifacts" not in resumed_commands[0]
     state = json.loads((run_dir / "run_state.json").read_text())
     assert state["attempts"][1]["status"] == "completed"
@@ -590,6 +610,7 @@ def test_missing_completed_output_reruns_stage_and_downstream(
     assert [Path(command[1]).name for command in resumed_commands] == [
         "merge_biom.py",
         "unifrac.py",
+        "faith_pd.py",
     ]
     assert "--refresh-input-artifacts" in resumed_commands[1]
 
@@ -624,6 +645,7 @@ def test_missing_deblur_output_does_not_rerun_independent_study(
         "run_deblur.py",
         "merge_biom.py",
         "unifrac.py",
+        "faith_pd.py",
     ]
     assert command_value(resumed_commands[0], "--data-dir") == first.resolve()
     assert "--refresh-input-artifacts" in resumed_commands[2]
@@ -739,6 +761,90 @@ def test_resume_treats_manifest_without_metric_as_unweighted(
                 [("ERP", study_dir)],
                 run_dir=run_dir,
                 extra=["--resume", "--metric", "weighted"],
+            )
+        )
+
+
+def test_faith_pd_uses_rarefied_table_and_color_by_columns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    study_dir = tmp_path / "study"
+    write_fastq(study_dir, "ERR1")
+    metadata = tmp_path / "metadata.tsv"
+    metadata.write_text("sample-id\tbody site\nERR1\tgut\n")
+    commands: list[list[str]] = []
+    install_fake_environment(monkeypatch, commands)
+
+    run_dir = run_pipeline.execute_pipeline(
+        make_args(tmp_path, [("ERP", study_dir)], metadata=metadata, color_by=["body site"])
+    )
+
+    faith = next(c for c in commands if Path(c[1]).name == "faith_pd.py")
+    assert command_value(faith, "--rarefied-table") == (
+        run_dir / "work" / "qiime2" / "rarefied-backbone-mapped-table.qza"
+    )
+    assert faith[faith.index("--group-by") + 1] == "body site"
+    assert (run_dir / "results" / "faith_pd_body_site.png").is_file()
+    manifest = json.loads((run_dir / "run_manifest.json").read_text())
+    assert manifest["alpha"] == {"faith_pd": True, "alpha_rarefaction": False}
+
+
+def test_alpha_flags_select_rarefaction_curve_without_faith_pd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    study_dir = tmp_path / "study"
+    write_fastq(study_dir, "ERR1")
+    commands: list[list[str]] = []
+    install_fake_environment(monkeypatch, commands)
+
+    run_dir = run_pipeline.execute_pipeline(
+        make_args(
+            tmp_path,
+            [("ERP", study_dir)],
+            extra=["--no-faith-pd", "--alpha-rarefaction"],
+        )
+    )
+
+    scripts = [Path(command[1]).name for command in commands]
+    assert scripts == ["run_deblur.py", "unifrac.py", "alpha_rarefaction.py"]
+    curve = commands[-1]
+    assert command_value(curve, "--mapped-table") == (
+        run_dir / "work" / "qiime2" / "backbone-mapped-table.qza"
+    )
+    assert curve[curve.index("--reference-depth") + 1] == "1000"
+    assert "--overwrite" in curve
+    state = json.loads((run_dir / "run_state.json").read_text())
+    assert set(state["stages"]) == {"deblur:ERP", "unifrac", "alpha_rarefaction"}
+
+
+def test_resume_adds_faith_pd_to_older_run_but_never_drops_stages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    study_dir = tmp_path / "study"
+    write_fastq(study_dir, "ERR1")
+    run_dir = tmp_path / "run"
+    commands: list[list[str]] = []
+    install_fake_environment(monkeypatch, commands)
+    run_pipeline.execute_pipeline(
+        make_args(tmp_path, [("ERP", study_dir)], run_dir=run_dir, extra=["--no-faith-pd"])
+    )
+
+    resumed_commands: list[list[str]] = []
+    install_fake_environment(monkeypatch, resumed_commands)
+    run_pipeline.execute_pipeline(
+        make_args(tmp_path, [("ERP", study_dir)], run_dir=run_dir, extra=["--resume"])
+    )
+    assert [Path(command[1]).name for command in resumed_commands] == ["faith_pd.py"]
+    state = json.loads((run_dir / "run_state.json").read_text())
+    assert state["stages"]["faith_pd"]["status"] == "completed"
+
+    with pytest.raises(RuntimeError, match="stage layout is incompatible"):
+        run_pipeline.execute_pipeline(
+            make_args(
+                tmp_path,
+                [("ERP", study_dir)],
+                run_dir=run_dir,
+                extra=["--resume", "--no-faith-pd"],
             )
         )
 

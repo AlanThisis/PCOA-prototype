@@ -28,6 +28,15 @@ GG2_ID_TREE_FILENAME = "2024.09.phylogeny.id.nwk.qza"
 UNIFRAC_METRICS = ("unweighted", "weighted")
 
 
+# Optional analysis stages that --resume may add to an existing run's state.
+ADDABLE_STAGES = frozenset({"faith_pd", "alpha_rarefaction"})
+ALPHA_RAREFACTION_OUTPUT_NAMES = (
+    "faith_pd_alpha_rarefaction.png",
+    "faith_pd_curve_summary.tsv",
+    "alpha_rarefaction_summary.json",
+)
+
+
 def unifrac_output_names(metric: str = "unweighted") -> tuple[str, ...]:
     return (
         f"pcoa_coordinates_{metric}_unifrac.txt",
@@ -207,6 +216,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--export-distance-tsv",
         choices=("auto", "always", "never"),
         default="auto",
+    )
+    parser.add_argument(
+        "--faith-pd",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Compute Faith's PD on the rarefied table UniFrac used, with a box plot "
+            "per --color-by column."
+        ),
+    )
+    parser.add_argument(
+        "--alpha-rarefaction",
+        action="store_true",
+        help="Also run the Faith's PD alpha-rarefaction curve (default: off).",
     )
     parser.add_argument(
         "--resume",
@@ -721,6 +744,10 @@ def build_manifest(
         "pcoa_memory_budget_gb": args.pcoa_memory_budget_gb,
         "export_distance_tsv": args.export_distance_tsv,
         "keep_deblur_tmp_files": args.keep_deblur_tmp_files,
+        "alpha": {
+            "faith_pd": args.faith_pd,
+            "alpha_rarefaction": args.alpha_rarefaction,
+        },
     }
 
 
@@ -775,6 +802,8 @@ def stage_output_paths(
     color_by: list[str],
     deblur_scheduler: str = "study",
     metric: str = "unweighted",
+    faith_pd: bool = False,
+    alpha_rarefaction: bool = False,
 ) -> dict[str, tuple[Path, ...]]:
     outputs: dict[str, tuple[Path, ...]] = {}
     if deblur_scheduler == "balanced-shards":
@@ -799,6 +828,16 @@ def stage_output_paths(
     outputs["unifrac"] = tuple(results_dir / name for name in unifrac_output_names(metric))
     for column in color_by:
         outputs[f"plot:{column}"] = (results_dir / f"pcoa_{safe_output_name(column)}.png",)
+    if faith_pd:
+        outputs["faith_pd"] = (
+            results_dir / "faith_pd.tsv",
+            results_dir / "faith_pd_summary.json",
+            *(results_dir / f"faith_pd_{safe_output_name(column)}.png" for column in color_by),
+        )
+    if alpha_rarefaction:
+        outputs["alpha_rarefaction"] = tuple(
+            results_dir / "alpha_rarefaction" / name for name in ALPHA_RAREFACTION_OUTPUT_NAMES
+        )
     return outputs
 
 
@@ -811,7 +850,8 @@ def build_stages(
 ) -> list[Stage]:
     run_dir = args.run_dir
     output_paths = stage_output_paths(
-        run_dir, studies, args.color_by, args.deblur_scheduler, args.metric
+        run_dir, studies, args.color_by, args.deblur_scheduler, args.metric,
+        args.faith_pd, args.alpha_rarefaction,
     )
     stages: list[Stage] = []
     deblur_workflows: list[Path] = []
@@ -1001,6 +1041,57 @@ def build_stages(
                 ("unifrac",),
             )
         )
+
+    qiime_work_dir = run_dir / "work" / "qiime2"
+    gg2_tree = args.gg2_dir / GG2_ID_TREE_FILENAME
+    if args.faith_pd:
+        command = [
+            sys.executable,
+            str(repo_dir / "src" / "faith_pd.py"),
+            "run",
+            "--rarefied-table",
+            str(qiime_work_dir / "rarefied-backbone-mapped-table.qza"),
+            "--phylogeny",
+            str(gg2_tree),
+            "--output-dir",
+            str(results_dir),
+            "--work-dir",
+            str(run_dir / "work" / "faith_pd"),
+            "--timings-tsv",
+            str(attempt_dir / "faith_pd.tsv"),
+        ]
+        if metadata is not None:
+            command.extend(("--metadata", str(metadata)))
+            for column in args.color_by:
+                command.extend(("--group-by", column))
+        stages.append(Stage("faith_pd", tuple(command), output_paths["faith_pd"], ("unifrac",)))
+    if args.alpha_rarefaction:
+        command = [
+            sys.executable,
+            str(repo_dir / "src" / "alpha_rarefaction.py"),
+            "run",
+            "--mapped-table",
+            str(qiime_work_dir / "backbone-mapped-table.qza"),
+            "--phylogeny",
+            str(gg2_tree),
+            "--output-dir",
+            str(results_dir / "alpha_rarefaction"),
+            "--overwrite",
+            "--timings-tsv",
+            str(attempt_dir / "alpha_rarefaction.tsv"),
+        ]
+        if args.sampling_depth is not None:
+            command.extend(("--reference-depth", str(args.sampling_depth)))
+        if metadata is not None:
+            command.extend(("--metadata", str(metadata)))
+        stages.append(
+            Stage(
+                "alpha_rarefaction",
+                tuple(command),
+                output_paths["alpha_rarefaction"],
+                ("unifrac",),
+            )
+        )
     return stages
 
 
@@ -1036,8 +1127,21 @@ def initialize_run(
         if state.get("schema_version") != SCHEMA_VERSION:
             raise RuntimeError("Unsupported run_state.json schema version")
         saved_stages = state.get("stages")
-        if not isinstance(saved_stages, dict) or set(saved_stages) != set(stage_names):
+        if not isinstance(saved_stages, dict):
             raise RuntimeError("Saved stage layout is incompatible with this invocation")
+        added = set(stage_names) - set(saved_stages)
+        if set(saved_stages) - set(stage_names) or not added <= ADDABLE_STAGES:
+            raise RuntimeError("Saved stage layout is incompatible with this invocation")
+        # Optional analysis stages (e.g. Faith's PD, now on by default) can be
+        # added to an older run; they start pending and run on this attempt.
+        for name in sorted(added):
+            saved_stages[name] = {
+                "status": "pending",
+                "attempt": None,
+                "started_utc": None,
+                "ended_utc": None,
+                "error": None,
+            }
         attempts = state.get("attempts")
         if not isinstance(attempts, list):
             raise RuntimeError("Invalid attempts list in run_state.json")
@@ -1297,7 +1401,8 @@ def execute_pipeline(args: argparse.Namespace) -> Path:
     studies, metadata, executables = validate_args(args)
     manifest = build_manifest(args, studies, metadata, executables, repo_dir)
     output_paths = stage_output_paths(
-        args.run_dir, studies, args.color_by, args.deblur_scheduler, args.metric
+        args.run_dir, studies, args.color_by, args.deblur_scheduler, args.metric,
+        args.faith_pd, args.alpha_rarefaction,
     )
     state, attempt_number = initialize_run(args, manifest, list(output_paths))
 
