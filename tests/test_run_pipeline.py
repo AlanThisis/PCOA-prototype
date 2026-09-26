@@ -81,7 +81,8 @@ def install_fake_environment(
         elif script == "unifrac.py":
             output_dir = command_value(command, "--results-dir")
             output_dir.mkdir(parents=True, exist_ok=True)
-            for filename in run_pipeline.UNIFRAC_OUTPUT_NAMES:
+            metric = command[command.index("--metric") + 1]
+            for filename in run_pipeline.unifrac_output_names(metric):
                 if filename.endswith(".json"):
                     (output_dir / filename).write_text('{"rarefied_samples": 1}\n')
                 else:
@@ -677,6 +678,69 @@ def test_resume_allows_new_code_commit_and_records_attempt_commit(
     state = json.loads((run_dir / "run_state.json").read_text())
     assert resumed_commands == []
     assert state["attempts"][1]["git_commit"] == "def456"
+
+
+def test_weighted_metric_is_forwarded_recorded_and_plotted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    study_dir = tmp_path / "study"
+    write_fastq(study_dir, "ERR1")
+    metadata = tmp_path / "metadata.tsv"
+    metadata.write_text("sample-id\tbody_site\nERR1\tgut\n")
+    commands: list[list[str]] = []
+    install_fake_environment(monkeypatch, commands)
+
+    run_dir = run_pipeline.execute_pipeline(
+        make_args(
+            tmp_path,
+            [("ERP", study_dir)],
+            metadata=metadata,
+            color_by=["body_site"],
+            extra=["--metric", "weighted"],
+        )
+    )
+
+    by_script = {Path(command[1]).name: command for command in commands}
+    assert by_script["unifrac.py"][by_script["unifrac.py"].index("--metric") + 1] == "weighted"
+    assert command_value(by_script["plot_pcoa.py"], "--pcoa") == (
+        run_dir / "results" / "pcoa_coordinates_weighted_unifrac.txt"
+    )
+    manifest = json.loads((run_dir / "run_manifest.json").read_text())
+    assert manifest["scientific_parameters"]["unifrac_metric"] == "weighted"
+
+
+def test_resume_treats_manifest_without_metric_as_unweighted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    study_dir = tmp_path / "study"
+    write_fastq(study_dir, "ERR1")
+    run_dir = tmp_path / "run"
+    commands: list[list[str]] = []
+    install_fake_environment(monkeypatch, commands)
+    run_pipeline.execute_pipeline(
+        make_args(tmp_path, [("ERP", study_dir)], run_dir=run_dir)
+    )
+    manifest_path = run_dir / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    del manifest["scientific_parameters"]["unifrac_metric"]
+    manifest_path.write_text(json.dumps(manifest))
+
+    resumed_commands: list[list[str]] = []
+    install_fake_environment(monkeypatch, resumed_commands)
+    run_pipeline.execute_pipeline(
+        make_args(tmp_path, [("ERP", study_dir)], run_dir=run_dir, extra=["--resume"])
+    )
+    assert resumed_commands == []
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        run_pipeline.execute_pipeline(
+            make_args(
+                tmp_path,
+                [("ERP", study_dir)],
+                run_dir=run_dir,
+                extra=["--resume", "--metric", "weighted"],
+            )
+        )
 
 
 def test_nonempty_run_requires_explicit_resume(

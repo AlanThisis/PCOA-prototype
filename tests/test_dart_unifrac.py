@@ -71,6 +71,24 @@ def test_dart_command_uses_reproducible_dmh_defaults() -> None:
     assert command[command.index("--bbits") + 1] == "16"
     assert "--pcoa" in command
     assert "--compress" in command
+    assert "--weighted" not in command
+
+
+def test_dart_command_adds_weighted_flag_only_when_requested() -> None:
+    command = dart_unifrac.build_dart_command(
+        "/env/bin/dartunifrac",
+        Path("tree.nwk"),
+        Path("table.biom"),
+        Path("distance.tsv"),
+        threads=8,
+        sketch_size=2048,
+        seed=1337,
+        bbits=16,
+        compress=False,
+        weighted=True,
+    )
+
+    assert "--weighted" in command
 
 
 def test_validate_dart_parameters_requires_the_v030_dimension_count() -> None:

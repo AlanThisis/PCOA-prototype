@@ -273,6 +273,8 @@ Deblur.
 
 `unifrac.py` uses GG2's `non-v4-16s` closed-reference action (vsearch at 99%) to map Deblur ASVs onto the GG2 backbone. QIIME2 also performs feature-table rarefaction, which defaults to 1,000 reads after mapping. DartUniFrac is then the default engine for unweighted UniFrac and its 10-axis randomized fPCoA (`dmh`, sketch 2048, seed 1337, 16-bit hashes). Use `--unifrac-engine qiime` for the exact QIIME2 fallback.
 
+Pass `--metric weighted` (to `run_pipeline.py` or `unifrac.py`) for weighted UniFrac instead. This is normalized weighted UniFrac on both engines: DART's `--weighted` and QIIME2's `weighted_normalized_unifrac`. Result files then use `weighted` in place of `unweighted`, for example `pcoa_coordinates_weighted_unifrac.txt`.
+
 ### Faith's PD alpha rarefaction
 
 Generate an alpha-rarefaction diagnostic directly from a completed GG2 mapping,

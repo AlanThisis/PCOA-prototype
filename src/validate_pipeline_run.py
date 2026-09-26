@@ -41,9 +41,10 @@ def validate_run(run_dir: Path) -> list[str]:
             problems.append(f"stage {name} has status {stage.get('status')}")
 
     results = run_dir / "results"
+    metric = manifest.get("scientific_parameters", {}).get("unifrac_metric", "unweighted")
     for filename in (
-        "pcoa_coordinates_unweighted_unifrac.txt",
-        "pcoa_plot_unweighted_unifrac.png",
+        f"pcoa_coordinates_{metric}_unifrac.txt",
+        f"pcoa_plot_{metric}_unifrac.png",
         "analysis_summary.json",
         "pipeline_summary.json",
     ):
@@ -100,7 +101,7 @@ def validate_run(run_dir: Path) -> list[str]:
     ):
         problems.append("UniFrac distance artifact is missing or empty")
     if distance.get("exported"):
-        distance_tsv = results / "distance_matrix_unweighted_unifrac.tsv"
+        distance_tsv = results / f"distance_matrix_{metric}_unifrac.tsv"
         if not distance_tsv.is_file() or distance_tsv.stat().st_size == 0:
             problems.append("distance TSV was declared exported but is missing")
     return problems

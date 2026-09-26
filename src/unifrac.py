@@ -61,6 +61,17 @@ from pipeline_lib import (
 GG2_BACKBONE_FILENAME = "2024.09.backbone.full-length.fna.qza"
 GG2_ID_TREE_FILENAME = "2024.09.phylogeny.id.nwk.qza"
 GG2_FTP_BASE = "https://ftp.microbio.me/greengenes_release/current/"
+# DART --weighted computes normalized weighted UniFrac, so the QIIME backend
+# must use weighted_normalized_unifrac for the two engines to agree.
+QIIME_UNIFRAC_METRICS = {
+    "unweighted": "unweighted_unifrac",
+    "weighted": "weighted_normalized_unifrac",
+}
+
+
+def metric_label(metric: str) -> str:
+    """Filename stem for a UniFrac metric, e.g. 'weighted_unifrac'."""
+    return f"{metric}_unifrac"
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,6 +129,15 @@ def parse_args() -> argparse.Namespace:
         choices=("dart", "qiime"),
         default="dart",
         help="UniFrac/PCoA backend after QIIME GG2 mapping and rarefaction (default: dart).",
+    )
+    parser.add_argument(
+        "--metric",
+        choices=tuple(QIIME_UNIFRAC_METRICS),
+        default="unweighted",
+        help=(
+            "UniFrac variant (default: unweighted). 'weighted' is normalized "
+            "weighted UniFrac on both engines."
+        ),
     )
     parser.add_argument(
         "--dartunifrac-executable",
@@ -304,6 +324,7 @@ def run_qiime2_unifrac(
     pcoa_method: str = "auto",
     pcoa_dimensions: int = 10,
     pcoa_memory_budget_gb: float | None = None,
+    metric: str = "unweighted",
 ) -> tuple[Path, int, dict[str, float | int | str]]:
     """Run QIIME2 import → backbone mapping → rarefied UniFrac PCoA.
 
@@ -319,8 +340,9 @@ def run_qiime2_unifrac(
         qiime=qiime,
         timing=timing,
     )
-    distance_matrix_qza = work_dir / "unweighted_unifrac_distance_matrix.qza"
-    pcoa_qza = work_dir / "unweighted_unifrac_pcoa_results.qza"
+    label = metric_label(metric)
+    distance_matrix_qza = work_dir / f"{label}_distance_matrix.qza"
+    pcoa_qza = work_dir / f"{label}_pcoa_results.qza"
 
     retained_sample_count = rarefied_stats["sample_count"]
     pcoa_policy = choose_pcoa_method(
@@ -337,7 +359,7 @@ def run_qiime2_unifrac(
         flush=True,
     )
 
-    print("Step 5/5: Computing unweighted UniFrac distance matrix and PCoA...")
+    print(f"Step 5/5: Computing {metric} UniFrac distance matrix and PCoA...")
     if distance_matrix_qza.exists():
         distance_matrix_qza.unlink()
     run_command(
@@ -350,14 +372,14 @@ def run_qiime2_unifrac(
             "--i-table",
             str(work_dir / "rarefied-backbone-mapped-table.qza"),
             "--p-metric",
-            "unweighted_unifrac",
+            QIIME_UNIFRAC_METRICS[metric],
             "--p-threads",
             str(threads),
             "--o-distance-matrix",
             str(distance_matrix_qza),
         ],
         timing=timing,
-        step="unweighted_unifrac",
+        step=label,
         item=str(distance_matrix_qza),
     )
 
@@ -650,7 +672,8 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
         clear_input_artifact_cache(work_dir)
 
     args.results_dir.mkdir(parents=True, exist_ok=True)
-    distance_result = args.results_dir / "distance_matrix_unweighted_unifrac.tsv"
+    label = metric_label(args.metric)
+    distance_result = args.results_dir / f"distance_matrix_{label}.tsv"
     if args.unifrac_engine == "qiime":
         unifrac_work_dir, sampling_depth, pcoa_policy = run_qiime2_unifrac(
             biom_fp=biom_fp,
@@ -665,16 +688,17 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
             pcoa_method=args.pcoa_method,
             pcoa_dimensions=args.pcoa_dimensions,
             pcoa_memory_budget_gb=args.pcoa_memory_budget_gb,
+            metric=args.metric,
         )
         export_distance, projected_distance_gib = should_export_distance_tsv(
             args.export_distance_tsv, int(pcoa_policy["sample_count"])
         )
         if export_distance:
             print("Exporting UniFrac distance matrix...")
-            dm_export_dir = work_dir / "unweighted_unifrac_dm_export"
+            dm_export_dir = work_dir / f"{label}_dm_export"
             export_artifact(
                 qiime,
-                unifrac_work_dir / "unweighted_unifrac_distance_matrix.qza",
+                unifrac_work_dir / f"{label}_distance_matrix.qza",
                 dm_export_dir,
                 timing=timing,
                 step="export_distance_matrix",
@@ -693,16 +717,16 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
             )
 
         print("Exporting UniFrac PCoA...")
-        pcoa_export_dir = work_dir / "unweighted_unifrac_pcoa_export"
+        pcoa_export_dir = work_dir / f"{label}_pcoa_export"
         export_artifact(
             qiime,
-            unifrac_work_dir / "unweighted_unifrac_pcoa_results.qza",
+            unifrac_work_dir / f"{label}_pcoa_results.qza",
             pcoa_export_dir,
             timing=timing,
             step="export_pcoa",
         )
         ordination_fp = pcoa_export_dir / "ordination.txt"
-        distance_backend_path = work_dir / "unweighted_unifrac_distance_matrix.qza"
+        distance_backend_path = work_dir / f"{label}_distance_matrix.qza"
     else:
         sampling_depth, rarefied_stats = prepare_qiime2_rarefied_inputs(
             biom_fp=biom_fp,
@@ -740,6 +764,7 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
             bbits=args.dart_bbits,
             compress=not export_distance,
             timing=timing,
+            weighted=args.metric == "weighted",
         )
         if int(dart_result["sample_count"]) != rarefied_stats["sample_count"]:
             raise RuntimeError(
@@ -771,16 +796,16 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
     with timing.step("copy_pcoa_coordinates"):
         shutil.copy(
             ordination_fp,
-            args.results_dir / "pcoa_coordinates_unweighted_unifrac.txt",
+            args.results_dir / f"pcoa_coordinates_{label}.txt",
         )
 
     print("Generating PCoA plot...")
     with timing.step("plot_unlabeled_pcoa"):
         plot_pcoa(
             ordination_fp=ordination_fp,
-            plot_fp=args.results_dir / "pcoa_plot_unweighted_unifrac.png",
+            plot_fp=args.results_dir / f"pcoa_plot_{label}.png",
             title=(
-                "PCoA — Unweighted UniFrac "
+                f"PCoA — {args.metric.capitalize()} UniFrac "
                 f"(Greengenes2 backbone, {args.unifrac_engine}, depth={sampling_depth})"
             ),
         )
@@ -794,6 +819,7 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
     )
     analysis_summary = {
         "unifrac_engine": args.unifrac_engine,
+        "metric": QIIME_UNIFRAC_METRICS[args.metric],
         "sampling_depth": sampling_depth,
         "mapped_samples": mapped_stats["sample_count"],
         "mapped_features": mapped_stats["feature_count"],
@@ -811,6 +837,7 @@ def run(args: argparse.Namespace, timing: TimingRecorder) -> int:
         analysis_summary["dart"] = {
             "version": detected_dart_version,
             "method": DART_METHOD,
+            "weighted": args.metric == "weighted",
             "sketch_size": args.dart_sketch_size,
             "seed": args.dart_seed,
             "bbits": args.dart_bbits,

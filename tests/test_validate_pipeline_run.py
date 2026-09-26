@@ -100,6 +100,37 @@ def test_validator_accepts_backend_distance_paths(tmp_path: Path) -> None:
         assert validate_pipeline_run.validate_run(run_dir) == []
 
 
+def test_validator_uses_metric_from_manifest(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    results = run_dir / "results"
+    results.mkdir(parents=True)
+    backend_path = run_dir / "work" / "weighted_unifrac_distance_matrix.tsv.zst"
+    backend_path.parent.mkdir()
+    backend_path.write_bytes(b"distance")
+    write_json(
+        run_dir / "run_state.json",
+        {"attempts": [{"status": "completed"}], "stages": {"unifrac": {"status": "completed"}}},
+    )
+    write_json(
+        run_dir / "run_manifest.json",
+        {"color_by": [], "scientific_parameters": {"unifrac_metric": "weighted"}},
+    )
+    for name in ("pcoa_coordinates_weighted_unifrac.txt", "pipeline_summary.json"):
+        (results / name).write_bytes(b"result")
+    write_json(
+        results / "analysis_summary.json",
+        {
+            "mapped_samples": 1,
+            "rarefied_samples": 1,
+            "distance_tsv": {"exported": False, "backend_path": str(backend_path)},
+        },
+    )
+
+    assert validate_pipeline_run.validate_run(run_dir) == [
+        "missing or empty result: pcoa_plot_weighted_unifrac.png"
+    ]
+
+
 def test_validator_reports_incomplete_stage_and_missing_qza(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     results = run_dir / "results"

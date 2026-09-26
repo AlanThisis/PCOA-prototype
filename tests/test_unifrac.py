@@ -87,6 +87,51 @@ def test_qiime_workflow_uses_distinct_scientific_timing_steps(
     assert "--p-number-of-dimensions" not in commands_by_step["pcoa"]
 
 
+def test_qiime_weighted_workflow_matches_dart_normalized_metric(
+    tmp_path: Path, monkeypatch
+) -> None:
+    calls: list[tuple[list[str], str]] = []
+
+    def fake_run_command(
+        args: list[str], cwd: Path | None = None, **kwargs: object
+    ) -> None:
+        del cwd
+        calls.append((args, str(kwargs["step"])))
+
+    monkeypatch.setattr(unifrac, "run_command", fake_run_command)
+    monkeypatch.setattr(
+        unifrac,
+        "table_stats_from_qza",
+        lambda *args, **kwargs: {"sample_count": 100, "feature_count": 5},
+    )
+    work_dir = tmp_path / "work"
+
+    unifrac.run_qiime2_unifrac(
+        biom_fp=tmp_path / "all.biom",
+        seqs_fp=tmp_path / "all.seqs.fa",
+        gg2_backbone_fp=tmp_path / "backbone.qza",
+        gg2_tree_fp=tmp_path / "tree.qza",
+        sampling_depth=100,
+        threads=4,
+        work_dir=work_dir,
+        qiime="/env/bin/qiime",
+        timing=TimingRecorder(None, component="unifrac"),
+        metric="weighted",
+    )
+
+    commands_by_step = {step: command for command, step in calls}
+    assert "unweighted_unifrac" not in commands_by_step
+    beta = commands_by_step["weighted_unifrac"]
+    assert beta[beta.index("--p-metric") + 1] == "weighted_normalized_unifrac"
+    assert beta[beta.index("--o-distance-matrix") + 1] == str(
+        work_dir / "weighted_unifrac_distance_matrix.qza"
+    )
+    pcoa = commands_by_step["pcoa"]
+    assert pcoa[pcoa.index("--o-pcoa") + 1] == str(
+        work_dir / "weighted_unifrac_pcoa_results.qza"
+    )
+
+
 def test_qiime_workflow_records_cached_mapping_as_skipped(
     tmp_path: Path, monkeypatch
 ) -> None:

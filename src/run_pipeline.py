@@ -25,11 +25,15 @@ SCHEMA_VERSION = 1
 STUDY_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 GG2_BACKBONE_FILENAME = "2024.09.backbone.full-length.fna.qza"
 GG2_ID_TREE_FILENAME = "2024.09.phylogeny.id.nwk.qza"
-UNIFRAC_OUTPUT_NAMES = (
-    "pcoa_coordinates_unweighted_unifrac.txt",
-    "pcoa_plot_unweighted_unifrac.png",
-    "analysis_summary.json",
-)
+UNIFRAC_METRICS = ("unweighted", "weighted")
+
+
+def unifrac_output_names(metric: str = "unweighted") -> tuple[str, ...]:
+    return (
+        f"pcoa_coordinates_{metric}_unifrac.txt",
+        f"pcoa_plot_{metric}_unifrac.png",
+        "analysis_summary.json",
+    )
 
 
 @dataclass(frozen=True)
@@ -172,6 +176,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("dart", "qiime"),
         default="dart",
         help="UniFrac/PCoA backend after QIIME GG2 mapping and rarefaction (default: dart).",
+    )
+    parser.add_argument(
+        "--metric",
+        choices=UNIFRAC_METRICS,
+        default="unweighted",
+        help=(
+            "UniFrac variant (default: unweighted). 'weighted' is normalized "
+            "weighted UniFrac on both engines."
+        ),
     )
     parser.add_argument(
         "--dartunifrac-executable",
@@ -696,6 +709,7 @@ def build_manifest(
             "pcoa_method": args.pcoa_method,
             "pcoa_dimensions": args.pcoa_dimensions,
             "unifrac_engine": args.unifrac_engine,
+            "unifrac_metric": args.metric,
             "dart_method": "dmh" if args.unifrac_engine == "dart" else None,
             "dart_sketch_size": args.dart_sketch_size,
             "dart_seed": args.dart_seed,
@@ -725,7 +739,12 @@ def compatibility_view(manifest: dict[str, Any]) -> dict[str, Any]:
         "export_distance_tsv",
         "keep_deblur_tmp_files",
     )
-    return {key: manifest.get(key) for key in keys}
+    view = {key: manifest.get(key) for key in keys}
+    parameters = view.get("scientific_parameters")
+    if isinstance(parameters, dict):
+        # Manifests written before --metric existed were always unweighted.
+        view["scientific_parameters"] = {"unifrac_metric": "unweighted", **parameters}
+    return view
 
 
 def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
@@ -755,6 +774,7 @@ def stage_output_paths(
     studies: list[Study],
     color_by: list[str],
     deblur_scheduler: str = "study",
+    metric: str = "unweighted",
 ) -> dict[str, tuple[Path, ...]]:
     outputs: dict[str, tuple[Path, ...]] = {}
     if deblur_scheduler == "balanced-shards":
@@ -776,7 +796,7 @@ def stage_output_paths(
         merged_dir = run_dir / "work" / "merged"
         outputs["merge"] = (merged_dir / "all.biom", merged_dir / "all.seqs.fa")
     results_dir = run_dir / "results"
-    outputs["unifrac"] = tuple(results_dir / name for name in UNIFRAC_OUTPUT_NAMES)
+    outputs["unifrac"] = tuple(results_dir / name for name in unifrac_output_names(metric))
     for column in color_by:
         outputs[f"plot:{column}"] = (results_dir / f"pcoa_{safe_output_name(column)}.png",)
     return outputs
@@ -791,7 +811,7 @@ def build_stages(
 ) -> list[Stage]:
     run_dir = args.run_dir
     output_paths = stage_output_paths(
-        run_dir, studies, args.color_by, args.deblur_scheduler
+        run_dir, studies, args.color_by, args.deblur_scheduler, args.metric
     )
     stages: list[Stage] = []
     deblur_workflows: list[Path] = []
@@ -925,6 +945,8 @@ def build_stages(
         args.export_distance_tsv,
         "--unifrac-engine",
         args.unifrac_engine,
+        "--metric",
+        args.metric,
     ]
     if args.unifrac_engine == "dart":
         command.extend(
@@ -959,7 +981,7 @@ def build_stages(
             sys.executable,
             str(repo_dir / "src" / "plot_pcoa.py"),
             "--pcoa",
-            str(results_dir / "pcoa_coordinates_unweighted_unifrac.txt"),
+            str(results_dir / f"pcoa_coordinates_{args.metric}_unifrac.txt"),
             "--metadata",
             str(metadata),
             "--color-by",
@@ -1275,7 +1297,7 @@ def execute_pipeline(args: argparse.Namespace) -> Path:
     studies, metadata, executables = validate_args(args)
     manifest = build_manifest(args, studies, metadata, executables, repo_dir)
     output_paths = stage_output_paths(
-        args.run_dir, studies, args.color_by, args.deblur_scheduler
+        args.run_dir, studies, args.color_by, args.deblur_scheduler, args.metric
     )
     state, attempt_number = initialize_run(args, manifest, list(output_paths))
 
