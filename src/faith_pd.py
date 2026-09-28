@@ -46,12 +46,20 @@ from pipeline_lib import (  # noqa: E402
 )
 from plot_pcoa import UNKNOWN_LABEL, load_id_to_label, strip_read_suffix  # noqa: E402
 
-BOX_COLOR = "#3987e5"
 INK = "#1f2933"
 MUTED = "#6b7280"
 GRID = "#e5e7eb"
-# Ordinal blue ramp (validated light->dark); the most reads gets the darkest step.
-LEVEL_RAMP = ("#0d366b", "#1c5cab", "#3987e5", "#86b6ef")
+NEUTRAL = "#9aa5b1"
+# Categorical palette (validated for colour-vision deficiency); boxes also carry black
+# outlines and axis labels, so identity never rests on colour alone.
+CATEGORICAL = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100",
+               "#e87ba4", "#008300", "#4a3aa7", "#e34948")
+BOX_STYLE = {
+    "patch_artist": True,
+    "medianprops": {"color": "black", "linewidth": 1.6},
+    "whiskerprops": {"color": "black", "linewidth": 1.2},
+    "capprops": {"color": "black", "linewidth": 1.2},
+}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -127,16 +135,22 @@ def style_axes(ax: plt.Axes) -> None:
     ax.set_axisbelow(True)
 
 
+def group_colors(groups) -> dict[str, str]:
+    """Colour follows the group name (alphabetical), not its rank in the plot."""
+    names = sorted(groups)
+    if len(names) > len(CATEGORICAL):
+        return {name: NEUTRAL for name in names}
+    return dict(zip(names, CATEGORICAL))
+
+
 def plot_groups(frame: pd.DataFrame, output: Path, column: str, test: dict) -> None:
     order = frame.groupby("group")["faith_pd"].median().sort_values(ascending=False).index
     data = [frame.loc[frame["group"] == g, "faith_pd"].to_numpy() for g in order]
+    colors = group_colors(order)
     fig, ax = plt.subplots(figsize=(10, 5.5))
-    ax.boxplot(
-        data, widths=0.6, showfliers=False, patch_artist=True,
-        boxprops={"facecolor": BOX_COLOR, "edgecolor": BOX_COLOR, "alpha": 0.85},
-        medianprops={"color": INK, "linewidth": 2},
-        whiskerprops={"color": MUTED}, capprops={"color": MUTED},
-    )
+    boxes = ax.boxplot(data, widths=0.6, showfliers=False, **BOX_STYLE)
+    for patch, group in zip(boxes["boxes"], order):
+        patch.set(facecolor=colors[group], edgecolor="black", linewidth=1.2)
     ax.set_xticks(range(1, len(order) + 1))
     ax.set_xticklabels([f"{g}\nn={len(d):,}" for g, d in zip(order, data)])
     ax.set_ylabel("Faith's PD", color=INK)
@@ -258,15 +272,12 @@ def plot_levels(long: pd.DataFrame, labels: list[str], output: Path, column: str
         subset = long[long["run"] == label]
         data = [subset.loc[subset["group"] == g, "faith_pd"].to_numpy() for g in order]
         positions = np.arange(len(order)) + (index - (len(labels) - 1) / 2) * width
-        color = LEVEL_RAMP[index % len(LEVEL_RAMP)]
-        ax.boxplot(
-            data, positions=positions, widths=width * 0.85, showfliers=False,
-            patch_artist=True,
-            boxprops={"facecolor": color, "edgecolor": color},
-            medianprops={"color": "white", "linewidth": 1.5},
-            whiskerprops={"color": color}, capprops={"color": color},
-        )
-        ax.plot([], [], color=color, linewidth=8, label=label)
+        color = CATEGORICAL[index] if index < len(CATEGORICAL) else NEUTRAL
+        boxes = ax.boxplot(data, positions=positions, widths=width * 0.85,
+                           showfliers=False, **BOX_STYLE)
+        for patch in boxes["boxes"]:
+            patch.set(facecolor=color, edgecolor="black", linewidth=1.0)
+        ax.bar(0, 0, color=color, edgecolor="black", linewidth=1.0, label=label)
     counts = long[long["run"] == reference].groupby("group").size()
     ax.set_xticks(range(len(order)))
     ax.set_xticklabels([f"{g}\nn={counts[g]:,}" for g in order])
